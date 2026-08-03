@@ -1,0 +1,13 @@
+# Data generation (works on any machine, no GPU, no Node/npm/Chromium needed)
+mermaidx>=0.9.4
+Pillow>=10.0
+numpy>=1.24
+matplotlib>=3.8
+
+# Tokenizer
+tokenizers>=0.20
+
+# Model + training (GPU strongly recommended for train_reconstructor.py)
+torch>=2.2
+torchvision>=0.17
+transformers>=4.40
