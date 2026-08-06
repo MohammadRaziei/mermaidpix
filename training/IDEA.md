@@ -204,6 +204,19 @@ encoder and one decoder step separately, then driving the loop in whatever
 runtime hosts the ONNX model). No action needed from me on this now; flagging
 it so it doesn't surprise you at export time.
 
+## Bugs found and fixed (via your actual test run)
+
+- **`AttributeError: 'BeitModel' object has no attribute 'encoder'`** in
+  `freeze_encoder_layers`. I'd assumed BEiT's internal structure mirrors
+  ViT's (`self.encoder.encoder.layer[i]`), but after fetching the actual
+  `transformers` source (`models/beit/modeling_beit.py`), `BeitModel` is
+  flatter: `self.embeddings` + `self.layers` directly (a plain
+  `nn.ModuleList` of `BeitLayer`), no intermediate `.encoder` wrapper.
+  Fixed to `self.encoder.layers[:n]`. This was caught by your `make
+  install` run (`python model.py` with random weights, no download) --
+  exactly the kind of thing that check exists to catch before a real
+  training run.
+
 ## What I'll change in the code to match this doc
 
 - `model.py`: swap `timm.create_model('vit_tiny_patch16_224', ...)` for

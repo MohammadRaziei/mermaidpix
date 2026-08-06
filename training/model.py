@@ -81,7 +81,7 @@ class MermaidReconstructor(nn.Module):
         train_reconstructor.py's optimizer param groups, not here)."""
         for param in self.encoder.embeddings.parameters():
             param.requires_grad = False
-        for block in self.encoder.encoder.layer[:n]:
+        for block in self.encoder.layers[:n]:
             for param in block.parameters():
                 param.requires_grad = False
 

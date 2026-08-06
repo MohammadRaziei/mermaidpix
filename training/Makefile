@@ -14,26 +14,26 @@ help:
 
 install:
 	pip install -r requirements.txt
-	python3 -c "import torch; print('torch', torch.__version__, '| CUDA available:', torch.cuda.is_available())"
-	python3 model.py
+	python -c "import torch; print('torch', torch.__version__, '| CUDA available:', torch.cuda.is_available())"
+	python model.py
 
 smoke-test:
-	python3 generate_dataset.py --smoke-test
+	python generate_dataset.py --smoke-test
 
 data: smoke-test
-	python3 generate_dataset.py --out ./data --router-n-per-class 300 --reconstructor-n-per-type 400
+	python generate_dataset.py --out ./data --router-n-per-class 300 --reconstructor-n-per-type 400
 
 tokenizer:
-	python3 train_tokenizer.py --manifest ./data/reconstructor/manifest.jsonl --out ./tokenizer
+	python train_tokenizer.py --manifest ./data/reconstructor/manifest.jsonl --out ./tokenizer
 
 train-router:
-	python3 train_router.py --data ./data/router --epochs 15
+	python train_router.py --data ./data/router --epochs 15
 
 train-reconstructor:
-	python3 train_reconstructor.py --data ./data/reconstructor --tokenizer ./tokenizer --epochs 30
+	python train_reconstructor.py --data ./data/reconstructor --tokenizer ./tokenizer --epochs 30
 
 package:
-	python3 package_results.py
+	python package_results.py
 
 all: install data tokenizer train-router train-reconstructor package
 	@echo ""

@@ -35,7 +35,14 @@ TROCR_CHECKPOINT = "microsoft/trocr-base-stage1"
 # normalization -- this must match what the pretrained encoder expects, or
 # the "pretrained" weights are being fed out-of-distribution inputs.
 _processor = AutoImageProcessor.from_pretrained(TROCR_CHECKPOINT)
-IMG_SIZE = _processor.size["height"] if isinstance(_processor.size, dict) else _processor.size
+raw_size = _processor.size
+if hasattr(raw_size, "height"):
+    IMG_SIZE = int(raw_size.height)
+elif hasattr(raw_size, "get"):
+    IMG_SIZE = int(raw_size.get("height", raw_size.get("shortest_edge", 384)))
+else:
+    IMG_SIZE = int(raw_size)
+
 IMAGE_MEAN = _processor.image_mean
 IMAGE_STD = _processor.image_std
 
@@ -85,17 +92,18 @@ class ReconstructorDataset(Dataset):
         return img_tensor, torch.tensor(ids, dtype=torch.long)
 
 
-def make_collate(pad_id: int):
-    def collate(batch):
+class PadCollate:
+    def __init__(self, pad_id: int):
+        self.pad_id = pad_id
+    
+    def __call__(self, batch):
         images, id_seqs = zip(*batch)
         images = torch.stack(images)
         max_len = max(len(ids) for ids in id_seqs)
-        padded = torch.full((len(id_seqs), max_len), pad_id, dtype=torch.long)
+        padded = torch.full((len(id_seqs), max_len), self.pad_id, dtype=torch.long)
         for i, ids in enumerate(id_seqs):
             padded[i, : len(ids)] = ids
         return images, padded
-    return collate
-
 
 def load_tokenizer(tokenizer_dir: Path) -> ByteLevelBPETokenizer:
     return ByteLevelBPETokenizer(
@@ -174,7 +182,8 @@ def main():
     val_ds = ReconstructorDataset(root, "val", tokenizer)
     print(f"train samples: {len(train_ds)}  val samples: {len(val_ds)}")
 
-    collate = make_collate(pad_id)
+    collate = PadCollate(pad_id)   
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, num_workers=2)
 

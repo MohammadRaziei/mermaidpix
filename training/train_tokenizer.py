@@ -39,7 +39,7 @@ def main():
     if not manifest_path.exists():
         raise SystemExit(f"Manifest not found: {manifest_path}. Run `make data` first.")
 
-    corpus_path = Path("/tmp/mermaid_corpus.txt")
+    corpus_path = Path("tmp/mermaid_corpus.txt")
     n = 0
     with open(manifest_path) as f, open(corpus_path, "w") as out:
         for line in f:
