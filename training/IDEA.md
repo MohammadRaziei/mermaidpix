@@ -248,13 +248,76 @@ memorizing "plausible" combinations stops being a viable shortcut, and the
 model has to actually attend to each label's pixels to get it right.
 **This alone doesn't guarantee the fix works** -- it's a reasonable, cheap
 first experiment (a data change, not an architecture change) to try before
-anything more involved like the PP-OCRv6 hybrid approach discussed
-separately. Re-run `make data && make tokenizer && make train-reconstructor`
+anything more involved like the PP-OCRv6 hybrid approach below.
+Re-run `make data && make tokenizer && make train-reconstructor`
 and send the new `results.zip`; if label accuracy improves substantially,
 the diagnosis was right and it's just a matter of how large the vocabulary
 needs to be. If it barely moves, that points toward a harder problem
 (e.g. label text is too small/low-resolution for the encoder to resolve
 individual characters reliably) that a bigger vocabulary alone won't fix.
+
+## Fallback plan if the vocabulary fix isn't enough: PP-OCRv6 hybrid
+
+You pointed me at `github.com/aiptimizer/TurboOCR`, a C++/TensorRT
+inference server bundling Baidu's **PP-OCRv6** models (text detection +
+recognition + layout + table + formula -> Markdown). Evaluated it as a
+candidate fix for the label-hallucination problem above.
+
+**Not usable directly**: TurboOCR is a deployment product (C++/CUDA/
+TensorRT/Docker, GPU-only), not something you import into a PyTorch
+training loop. It also has no concept of "Mermaid diagram" / "arrow" /
+"decision node" -- it reads general documents into text + tables, not
+diagram graph structure.
+
+**What IS relevant**: the underlying PP-OCRv6 *models* it runs, already
+exported to ONNX:
+
+| Component | Sizes across tiers |
+|---|---|
+| Text detection | 1.7 / 9.4 / 59 MB |
+| Text recognition | **4.3** / 20 / 73 MB |
+
+Two things make this worth revisiting if the vocabulary fix (above) turns
+out not to be enough on its own:
+
+1. It's a stronger, more targeted version of the exact idea behind the
+   TrOCR encoder swap earlier in this doc -- a model pretrained
+   specifically to read text, not classify ImageNet photos -- but at
+   **~20x smaller** (4.3MB vs. BEiT-Base's 86M-param encoder) while still
+   benchmarking well above 90% F1 on real-world text (FUNSD, CORD).
+2. It resolves an objection I raised earlier against using PP-OCR at all:
+   "it's PaddlePaddle, conversion risk." TurboOCR already did that ONNX
+   conversion work.
+
+**Why this wasn't implemented instead of the vocabulary fix**: it's a real
+architecture change (a second model, a second inference pass, and --
+critically -- it needs each label's *bounding box* to crop and OCR
+individually, which the current seq2seq design deliberately doesn't
+produce; see "Why this architecture" at the top of this doc for why we
+moved away from per-element bounding boxes in the first place). The
+vocabulary fix costs nothing architecturally and directly tests whether
+the problem is "the model exploited low label entropy" (data problem) vs.
+"the model genuinely can't resolve small text" (capability problem) --
+worth knowing which one it is before deciding whether a second OCR model
+and a return to bounding-box-style outputs is actually necessary.
+
+**If the vocabulary fix doesn't move the needle**, the concrete hybrid
+design would be:
+- Keep the current reconstructor for structure (shapes, edges, branch
+  labels) -- it already gets this right.
+- Add PP-OCRv6's detection model to find each label's bounding box in the
+  original image (a new capability -- current architecture has no
+  detection step at all).
+- Crop each detected box, run PP-OCRv6 recognition (4.3MB tier) on it for
+  the actual text.
+- Match each OCR'd text box to the nearest node/edge the reconstructor
+  emitted (by position), and substitute in the OCR'd text in place of
+  whatever label the decoder generated.
+
+This is a bigger change (new detection step, a matching/substitution
+post-process, two more ONNX models to integrate) than anything else in
+this document so far, which is why it's parked as a fallback rather than
+implemented alongside the vocabulary fix.
 
 ## Bugs found and fixed (via your actual test run)
 
