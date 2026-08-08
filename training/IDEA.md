@@ -204,7 +204,67 @@ encoder and one decoder step separately, then driving the loop in whatever
 runtime hosts the ONNX model). No action needed from me on this now; flagging
 it so it doesn't surprise you at export time.
 
+## Finding from your first real training run: structure learned, labels hallucinated
+
+Analyzed `results.zip` from your `make train-reconstructor` run. Summary:
+
+| Metric | Value |
+|---|---|
+| `val_loss` best | 0.510 (epoch 10) then **rises** to 0.967 by epoch 30 -- overfitting past ~epoch 10-12 |
+| `val_token_acc` | plateaus around 0.84-0.85 after epoch 10 |
+| Structure-only match (shapes/edges/Yes-No labels, ignoring node text) | **5/8 (62.5%)** on inspected samples |
+| Exact match (including node label text) | **0/8 (0%)** |
+
+Also caught a bug in my own analysis code: `qualitative_samples` took the
+first N rows of the val set without shuffling, and since the manifest is
+built by iterating diagram types in a fixed order, all 8 inspected samples
+turned out to be `flowchart` -- zero visibility into any other diagram
+type. Fixed (see "Bugs found and fixed" below).
+
+**The real pattern in every inspected sample**: node count, shape types,
+edge topology, and Yes/No branch labels came out **perfectly correct**.
+Only the node/edge *label text* was wrong -- and wrong in a specific way:
+always a grammatically-plausible verb+noun combination, just not the one
+actually in the image (e.g. predicting `"Retry request"` where the image
+said `"Send invoice"`).
+
+**Why this happened**: `_VERBS`/`_NOUNS` in `common/diagram_generators.py`
+had only 20 words each -- 361 possible two-word labels. With that little
+entropy, a big enough decoder doesn't need to actually read the label
+pixels; it can partially get away with learning "this position in a
+flowchart tends to say something like X" from the training distribution
+alone, the same way a language model completes a sentence from context
+without looking at a specific word. That's a shortcut a narrow synthetic
+vocabulary makes available, and a real trained model will happily take it
+if it's available -- it's a property of the training data, not something
+wrong with the architecture. The structural part of the task (shapes,
+edges, branches) has genuinely low entropy in real Mermaid flowcharts, so
+learning it well fast is expected and fine; the label-reading part
+shouldn't have low entropy, and 361 combinations accidentally gave it some.
+
+**Fix applied**: expanded `_VERBS` to 161 words and `_NOUNS` to 196 words
+(31,556 possible combinations, ~87x more than before) -- enough that
+memorizing "plausible" combinations stops being a viable shortcut, and the
+model has to actually attend to each label's pixels to get it right.
+**This alone doesn't guarantee the fix works** -- it's a reasonable, cheap
+first experiment (a data change, not an architecture change) to try before
+anything more involved like the PP-OCRv6 hybrid approach discussed
+separately. Re-run `make data && make tokenizer && make train-reconstructor`
+and send the new `results.zip`; if label accuracy improves substantially,
+the diagnosis was right and it's just a matter of how large the vocabulary
+needs to be. If it barely moves, that points toward a harder problem
+(e.g. label text is too small/low-resolution for the encoder to resolve
+individual characters reliably) that a bigger vocabulary alone won't fix.
+
 ## Bugs found and fixed (via your actual test run)
+
+- **`qualitative_samples` only ever inspected `flowchart` examples.** It
+  took `val_dataset[:n]` without shuffling; since `manifest.jsonl` is
+  written by iterating diagram types in a fixed order, the first N rows of
+  any val split are always the first diagram type in that order
+  (`flowchart`). Fixed to sample `n_per_type` examples from *every* diagram
+  type present in the val split, so results now cover all 29 types instead
+  of silently only ever checking one.
 
 - **`AttributeError: 'BeitModel' object has no attribute 'encoder'`** in
   `freeze_encoder_layers`. I'd assumed BEiT's internal structure mirrors

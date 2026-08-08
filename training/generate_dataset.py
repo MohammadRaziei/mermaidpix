@@ -129,7 +129,7 @@ def smoke_test():
     print("Running smoke test: rendering one tiny flowchart...")
     png = render_png("flowchart TD\n    A[Start] --> B[End]")
     if png is not None:
-        with open("/tmp/mermaidx_smoketest.png", "wb") as f:
+        with open("tmp/mermaidx_smoketest.png", "wb") as f:
             f.write(png)
         print("OK -- mermaidx is working. Safe to run the full generation.")
         return True

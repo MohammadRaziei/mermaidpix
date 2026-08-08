@@ -130,23 +130,33 @@ def evaluate(model, loader, device, pad_id, criterion):
 
 
 @torch.no_grad()
-def qualitative_samples(model, dataset, tokenizer, device, n=5):
+def qualitative_samples(model, dataset, tokenizer, device, n_per_type=2):
+    """Samples n_per_type examples from EACH diagram type present in the val
+    split, not just the first n rows overall -- the manifest is built by
+    iterating diagram types in order, so val_ds[:n] was silently always
+    100% flowchart examples in the previous version of this function,
+    leaving every other diagram type completely unchecked."""
+    by_type: dict[str, list[int]] = {}
+    for idx, row in enumerate(dataset.rows):
+        by_type.setdefault(row["diagram_type"], []).append(idx)
+
     samples = []
-    for i in range(min(n, len(dataset))):
-        img_tensor, gt_ids = dataset[i]
-        gt_text = tokenizer.decode([t for t in gt_ids.tolist() if t not in
-                                     (dataset.bos_id, dataset.eos_id, dataset.pad_id)])
-        pred_ids = model.generate(img_tensor.unsqueeze(0).to(device),
-                                   bos_id=dataset.bos_id, eos_id=dataset.eos_id)
-        pred_text = tokenizer.decode([t for t in pred_ids[0].tolist() if t not in
-                                       (dataset.bos_id, dataset.eos_id, dataset.pad_id)])
-        samples.append({
-            "file_name": dataset.rows[i]["file_name"],
-            "diagram_type": dataset.rows[i]["diagram_type"],
-            "ground_truth": gt_text,
-            "prediction": pred_text,
-            "exact_match": gt_text.strip() == pred_text.strip(),
-        })
+    for diagram_type, indices in sorted(by_type.items()):
+        for idx in indices[:n_per_type]:
+            img_tensor, gt_ids = dataset[idx]
+            gt_text = tokenizer.decode([t for t in gt_ids.tolist() if t not in
+                                         (dataset.bos_id, dataset.eos_id, dataset.pad_id)])
+            pred_ids = model.generate(img_tensor.unsqueeze(0).to(device),
+                                       bos_id=dataset.bos_id, eos_id=dataset.eos_id)
+            pred_text = tokenizer.decode([t for t in pred_ids[0].tolist() if t not in
+                                           (dataset.bos_id, dataset.eos_id, dataset.pad_id)])
+            samples.append({
+                "file_name": dataset.rows[idx]["file_name"],
+                "diagram_type": diagram_type,
+                "ground_truth": gt_text,
+                "prediction": pred_text,
+                "exact_match": gt_text.strip() == pred_text.strip(),
+            })
     return samples
 
 
@@ -234,7 +244,7 @@ def main():
         json.dump(history, f, indent=2)
 
     print("\nGenerating qualitative samples on val set...")
-    samples = qualitative_samples(model, val_ds, tokenizer, device, n=8)
+    samples = qualitative_samples(model, val_ds, tokenizer, device, n_per_type=2)
     with open(results_dir / "qualitative_samples.json", "w") as f:
         json.dump(samples, f, indent=2)
     exact_match_rate = sum(s["exact_match"] for s in samples) / len(samples)
@@ -254,7 +264,7 @@ def main():
 
     print(f"\nBest val loss: {best_val_loss:.4f}")
     print(f"Final val token accuracy: {history[-1]['val_token_acc']:.4f}")
-    print(f"Qualitative exact-match rate (8 samples): {exact_match_rate:.2f}")
+    print(f"Qualitative exact-match rate ({len(samples)} samples, ~2 per diagram type): {exact_match_rate:.2f}")
     print(f"Saved model + history + samples to {results_dir}/")
     print(
         "\n>>> Please paste back: the train/val loss curve, final val_token_acc, "
