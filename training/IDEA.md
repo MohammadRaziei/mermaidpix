@@ -258,36 +258,69 @@ individual characters reliably) that a bigger vocabulary alone won't fix.
 
 ## Fallback plan if the vocabulary fix isn't enough: PP-OCRv6 hybrid
 
-You pointed me at `github.com/aiptimizer/TurboOCR`, a C++/TensorRT
+You pointed me at [TurboOCR](https://github.com/aiptimizer/TurboOCR), a C++/TensorRT
 inference server bundling Baidu's **PP-OCRv6** models (text detection +
 recognition + layout + table + formula -> Markdown). Evaluated it as a
 candidate fix for the label-hallucination problem above.
 
-**Not usable directly**: TurboOCR is a deployment product (C++/CUDA/
-TensorRT/Docker, GPU-only), not something you import into a PyTorch
-training loop. It also has no concept of "Mermaid diagram" / "arrow" /
-"decision node" -- it reads general documents into text + tables, not
-diagram graph structure.
+**Not usable directly**: TurboOCR is a deployment product, not something
+you import into a PyTorch training loop. It also has no concept of
+"Mermaid diagram" / "arrow" / "decision node" -- it reads general
+documents into text + tables, not diagram graph structure.
 
-**What IS relevant**: the underlying PP-OCRv6 *models* it runs, already
-exported to ONNX:
+**No C++ binding needed, though** -- it's already a server (HTTP on
+`:8000` + gRPC on `:50051`), not a raw library. Integration from Python is
+just an HTTP call, nothing to compile or link:
+
+```python
+import requests
+
+with open("diagram.png", "rb") as f:
+    resp = requests.post("http://localhost:8000/ocr/raw", data=f.read(),
+                          headers={"Content-Type": "image/png"})
+# [{"text": "Invoice Total", "confidence": 0.97,
+#   "bounding_box": [[42,10],[210,10],[210,38],[42,38]]}, ...]
+results = resp.json()["results"]
+```
+
+Each result already has a `bounding_box` + `text` + `confidence` -- exactly
+the shape needed for the crop/match/substitute design below. A `proto/`
+folder is also in the repo, so a native gRPC client is generatable via
+`grpcio-tools` if HTTP overhead ever matters; not needed to get started.
+
+**Real blocker to check before going further down this path**: TurboOCR's
+Docker image requires **Linux + NVIDIA GPU (Turing or newer) + driver
+595+** (`docker run --gpus all ...`). Your `make install` output earlier
+showed `CUDA available: False` -- if that's still the case, this server
+won't start at all until that's resolved (driver install, or confirming
+whether the machine actually has an NVIDIA GPU). Worth resolving that
+question on its own regardless of this fallback, since GPU-less training
+of the ~105M-param reconstructor is also going to be very slow.
+
+**Lighter alternative if the GPU/driver situation doesn't resolve
+quickly**: PaddleOCR publishes the underlying PP-OCRv6 detection +
+recognition weights as standalone ONNX files in their own model zoo
+(TurboOCR's `fetch_release_models.sh` pulls from there rather than
+shipping its own weights). Those could in principle be run directly with
+`onnxruntime` in plain Python -- CPU-compatible, no Docker, no TensorRT,
+no GPU driver -- at the cost of losing TurboOCR's engineering (TensorRT
+FP16 optimization, batching, layout/table/formula stages, the whole
+served-API convenience). **I haven't verified the exact download
+location/filenames for these standalone weights** -- worth a quick check
+before assuming this path is as simple as it sounds.
+
+**What IS relevant regardless of which path**: the actual model sizes:
 
 | Component | Sizes across tiers |
 |---|---|
 | Text detection | 1.7 / 9.4 / 59 MB |
 | Text recognition | **4.3** / 20 / 73 MB |
 
-Two things make this worth revisiting if the vocabulary fix (above) turns
-out not to be enough on its own:
-
-1. It's a stronger, more targeted version of the exact idea behind the
-   TrOCR encoder swap earlier in this doc -- a model pretrained
-   specifically to read text, not classify ImageNet photos -- but at
-   **~20x smaller** (4.3MB vs. BEiT-Base's 86M-param encoder) while still
-   benchmarking well above 90% F1 on real-world text (FUNSD, CORD).
-2. It resolves an objection I raised earlier against using PP-OCR at all:
-   "it's PaddlePaddle, conversion risk." TurboOCR already did that ONNX
-   conversion work.
+This is a stronger, more targeted version of the exact idea behind the
+TrOCR encoder swap earlier in this doc -- a model pretrained specifically
+to read text, not classify ImageNet photos -- but at **~20x smaller**
+(4.3MB vs. BEiT-Base's 86M-param encoder) while still benchmarking well
+above 90% word-F1 on real-world forms/receipts (FUNSD, CORD).
 
 **Why this wasn't implemented instead of the vocabulary fix**: it's a real
 architecture change (a second model, a second inference pass, and --
@@ -305,19 +338,20 @@ and a return to bounding-box-style outputs is actually necessary.
 design would be:
 - Keep the current reconstructor for structure (shapes, edges, branch
   labels) -- it already gets this right.
-- Add PP-OCRv6's detection model to find each label's bounding box in the
-  original image (a new capability -- current architecture has no
-  detection step at all).
-- Crop each detected box, run PP-OCRv6 recognition (4.3MB tier) on it for
-  the actual text.
-- Match each OCR'd text box to the nearest node/edge the reconstructor
+- Run PP-OCRv6 detection (via TurboOCR's `/ocr/raw`, or the standalone
+  ONNX path above) to find every label's bounding box in the original
+  image (a new capability -- current architecture has no detection step
+  at all).
+- Recognition is bundled into that same `/ocr/raw` response -- no separate
+  crop-and-recognize step needed if using TurboOCR's API directly.
+- Match each returned text box to the nearest node/edge the reconstructor
   emitted (by position), and substitute in the OCR'd text in place of
   whatever label the decoder generated.
 
-This is a bigger change (new detection step, a matching/substitution
-post-process, two more ONNX models to integrate) than anything else in
-this document so far, which is why it's parked as a fallback rather than
-implemented alongside the vocabulary fix.
+This is a bigger change (new detection+matching step, a second service
+dependency, a hard GPU/driver requirement if going the TurboOCR-server
+route) than anything else in this document so far, which is why it's
+parked as a fallback rather than implemented alongside the vocabulary fix.
 
 ## Bugs found and fixed (via your actual test run)
 
