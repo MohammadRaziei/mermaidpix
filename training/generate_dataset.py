@@ -30,6 +30,7 @@ import argparse
 import io
 import json
 import random
+import tempfile
 from pathlib import Path
 
 import mermaidx
@@ -129,9 +130,10 @@ def smoke_test():
     print("Running smoke test: rendering one tiny flowchart...")
     png = render_png("flowchart TD\n    A[Start] --> B[End]")
     if png is not None:
-        with open("tmp/mermaidx_smoketest.png", "wb") as f:
+        out_path = Path(tempfile.gettempdir()) / "mermaidx_smoketest.png"
+        with open(out_path, "wb") as f:
             f.write(png)
-        print("OK -- mermaidx is working. Safe to run the full generation.")
+        print(f"OK -- mermaidx is working. Wrote a test image to {out_path}")
         return True
     print("FAILED -- mermaidx did not produce an image. Check `make install` output.")
     return False
@@ -159,3 +161,4 @@ if __name__ == "__main__":
     generate_reconstructor_dataset(out / "reconstructor", args.reconstructor_n_per_type, args.seed)
 
     print("\nDone. Next: make tokenizer && make train-router && make train-reconstructor")
+    

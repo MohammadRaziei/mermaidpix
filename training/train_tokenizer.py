@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from pathlib import Path
 
 from tokenizers import ByteLevelBPETokenizer
@@ -39,7 +40,7 @@ def main():
     if not manifest_path.exists():
         raise SystemExit(f"Manifest not found: {manifest_path}. Run `make data` first.")
 
-    corpus_path = Path("tmp/mermaid_corpus.txt")
+    corpus_path = Path(tempfile.gettempdir()) / "mermaid_corpus.txt"
     n = 0
     with open(manifest_path) as f, open(corpus_path, "w") as out:
         for line in f:
@@ -81,3 +82,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
