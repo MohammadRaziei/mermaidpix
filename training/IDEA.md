@@ -39,40 +39,84 @@ TrOCR's encoder is), rather than only as an external post-process
 OCR" below). Initial answer given in-conversation was "no, different
 architecture families can't be spliced together" -- **that answer was
 pushed back on, correctly, and turned out to be an oversimplification**.
-Mid-correction when this doc was handed off:
+Here's the resolution, reached by actually cloning
+`frotms/PaddleOCR2Pytorch` (GitHub, reachable from a restricted network)
+and reading the real `nn.Module` source
+(`pytorchocr/modeling/backbones/rec_lcnetv4.py`), not by speculating:
 
-- Real PyTorch ports of PaddleOCR/PP-OCR exist and were verified via web
-  search (not yet hands-on tested): `frotms/PaddleOCR2Pytorch` (inference
-  code) + `JoyCN/PaddleOCR-Pytorch` on HuggingFace (weights in safetensors,
-  described as "converted bit-exactly from the official PaddlePaddle
-  .pdparams... inference outputs are identical to the original PaddleOCR
-  down to float32 precision"). This means the weights genuinely could be
-  loaded as real `nn.Module` layers with real gradients -- "different
-  framework" is not actually a blocker.
-- The real remaining design question is **input format, not architecture
-  family**: PP-OCR's recognition backbone (CNN, e.g. PPLCNetV4) is built
-  to take roughly-single-line, pre-cropped text regions, not a whole
-  padded-square diagram image the way TrOCR's ViT patches happily do. Two
-  concrete design options to evaluate, neither implemented yet:
-  1. **Dual-encoder**: run PP-OCR's CNN backbone on the *whole* image in
-     parallel with TrOCR's ViT (fully-convolutional backbones tolerate
-     varying input resolution), concatenate both into the decoder's
-     cross-attention memory. No bounding boxes needed. Unverified whether
-     features computed this way (whole-image input instead of the
-     cropped-line input it was trained on) actually retain useful signal.
-  2. **Detection + crop + recognize**: bring back a per-label bounding-box
-     step (could even reuse PP-OCR's own *detection* model, also portable
-     to PyTorch via the same conversion project), crop each region to the
-     format PP-OCR's recognizer actually expects, and feed that in as an
-     auxiliary signal. More faithful to how PP-OCR was trained, more
-     invasive to the current architecture (reintroduces bounding boxes,
-     which the seq2seq design deliberately avoided -- see "Why this
-     architecture" further down).
-- **Nothing here has been hands-on verified yet** -- no one has actually
-  loaded `PaddleOCR2Pytorch` + the `JoyCN` weights and inspected real
-  tensor shapes coming out of the CNN backbone. That's the concrete next
-  step before picking between option 1 and 2 above, or deciding this isn't
-  worth the complexity until the vocabulary-fix retrain results are in.
+- **Confirmed real PyTorch layers exist**: `PPLCNetV4`, a genuine
+  `nn.Module` (Conv2D_BN + depthwise-separable blocks + SE layers -- a
+  MobileNet-style CNN), converted bit-exactly from official PaddlePaddle
+  weights (per `JoyCN/PaddleOCR-Pytorch` on HuggingFace). "Different
+  framework" was never actually a blocker -- that part of the original
+  dismissal was wrong.
+- **But there IS a real, specific, code-level reason option 1
+  ("dual-encoder, run the recognition backbone on the whole image") does
+  NOT work**, found in the recognition branch's `forward()`:
+  ```python
+  x = self.conv1(x); x = self.blocks2(x); ...; x = self.blocks6(x)
+  if self.training:
+      x = F.adaptive_avg_pool2d(x, [1, 40])   # <-- collapses height to 1
+  ```
+  This backbone is built to consume an already-cropped single line of
+  text, and its final step average-pools the *entire height dimension
+  down to 1*. Feed it a whole Mermaid diagram (multiple labels at
+  different vertical positions) and this pooling step blends every
+  label's features into the same row, destroying exactly the information
+  needed to tell "node 3's label" apart from "node 7's label." This is
+  the real reason, not "incompatible architecture family" in the abstract.
+- **The same file's `det=True` branch does NOT have this problem** -- PP-OCR's
+  *detection* backbone (same PPLCNetV4 class, different forward path)
+  returns a list of multi-scale 2D feature maps with height and width both
+  preserved, structurally much closer to the role TrOCR's ViT plays now.
+  This makes a revised "dual-encoder" design plausible: pair TrOCR's ViT
+  with PP-OCR's *detection* backbone (not recognition), both feeding the
+  decoder's cross-attention memory. Not yet implemented or tested.
+- **Practical conclusion**: for accurately reading exact label text, the
+  architecturally faithful path is still "detection + crop + recognize"
+  (option 2) -- crop each label to roughly the single-line shape the
+  recognition backbone actually expects, matching how PP-OCR was trained.
+  This reintroduces per-label bounding boxes, which the current seq2seq
+  design deliberately avoided (see "Why this architecture" further down)
+  -- still a real architecture change, just now backed by a concrete
+  reason instead of a vague one.
+- **Better path found, GitHub-only, no HuggingFace needed**: `pyturboocr`
+  (already installed, see "Fallback plan" below) caches its ONNX models
+  locally after first run --
+  `~/.cache/pyturboocr/{det_tiny,rec_tiny,cls}.onnx`, downloaded from a
+  GitHub Release. Opened `rec_tiny.onnx` directly with the `onnx` Python
+  package (no onnxruntime needed just to inspect it):
+  - 120 weight tensors, cleanly named in Paddle's original op convention
+    (`conv2d_0.w_0`, `batch_norm2d_0.w_0`, ...) -- Conv and BatchNorm are
+    *not* fused together, so each tensor maps directly onto a normal
+    `nn.Conv2d` / `nn.BatchNorm2d` pair. 1,104,524 total params (~4.2MB
+    fp32) for the recognition model alone.
+  - **The height=48-fixed constraint was confirmed a second, fully
+    independent way**: the ONNX graph's own declared input shape is
+    `[batch, 3, 48, dynamic_width]` -- height is a fixed dimension, not
+    dynamic. This matches what the PyTorch source's
+    `adaptive_avg_pool2d(x, [1, 40])` implied, but now verified from the
+    raw exported graph too, not just inferred from one source.
+  - This means weights could be extracted directly from this ONNX file
+    and loaded into the `PPLCNetV4` PyTorch class (found in
+    `PaddleOCR2Pytorch`) by matching tensor names -- entirely from GitHub
+    sources (the ONNX via `pyturboocr`'s release, the architecture code
+    via `PaddleOCR2Pytorch`'s repo), sidestepping the HuggingFace
+    dependency noted below entirely. **Not yet implemented** -- the actual
+    name-matching / weight-copying code hasn't been written, and no
+    forward pass has been run to confirm the loaded weights produce
+    correct outputs.
+- **Alternative, not yet tried**: downloading `JoyCN`'s HuggingFace-hosted
+  safetensors weights isn't possible from this sandbox (HuggingFace isn't
+  in its allowed domains, only GitHub is) -- moot now that the ONNX path
+  above covers the same ground without needing HuggingFace at all, but
+  worth knowing both options exist.
+- Whoever picks this up next should either (a) write the ONNX-initializer
+  -> `PPLCNetV4` weight-loading code and verify it against a real cropped
+  Mermaid label, or (b) if on a network with HuggingFace access, just load
+  `JoyCN`'s weights directly and skip the manual mapping. Either way,
+  confirm the loaded model reads real text correctly before writing any
+  further integration code.
 
 **Also still open / not yet done**: `train_reconstructor.py` has zero
 image-level data augmentation (no rotation/color-jitter/noise at load
