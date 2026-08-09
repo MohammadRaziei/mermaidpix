@@ -1,5 +1,89 @@
 # IDEA.md — Swapping the encoder to an OCR-pretrained one (TrOCR)
 
+## STATUS & HANDOFF — read this first if you're a new session
+
+This doc grew out of a long conversation. If you're picking this up fresh
+(new chat, no memory of how we got here), start here.
+
+**What's built and working**: the full pipeline in this repo
+(`common/diagram_generators.py` -> `generate_dataset.py` ->
+`train_tokenizer.py` -> `train_router.py`/`train_reconstructor.py` ->
+`infer.py`) runs. Architecture: MobileNetV3-Small router (30 classes: 29
+Mermaid diagram types + "not a diagram") + a TrOCR-BEiT-Base-encoder /
+custom-decoder reconstructor for image -> Mermaid code. See "Architecture"
+and "Frozen vs. trainable" sections below for the trained model itself.
+
+**What we know from one real training run**: router hit 100% val accuracy
+trivially fast. Reconstructor learned diagram *structure* (node count,
+shapes, edge topology, Yes/No branch labels) essentially perfectly, but
+*hallucinated* node/edge label text instead of reading it -- see "Finding
+from your first real training run" below for the full diagnosis. Root
+cause identified: the label vocabulary generator used only 361 possible
+two-word labels, cheap enough for the model to partially memorize instead
+of actually reading pixels.
+
+**Fix applied, not yet validated**: expanded the vocabulary 87x (361 ->
+31,556 possible combinations, see `common/diagram_generators.py`). A
+retrain was kicked off but **results have not been reported back in this
+conversation yet**. First thing to do in a new session: ask for that
+`results.zip` if it hasn't arrived, and diagnose it the same way the first
+one was diagnosed (loss curves, structure-vs-label accuracy split,
+qualitative samples across *all* diagram types, not just flowchart -- that
+bug is already fixed in `train_reconstructor.py`).
+
+**Open question that was being actively worked when this doc was handed
+off**: whether PP-OCRv6's pretrained recognition weights can be
+genuinely integrated as trained/frozen layers *inside* the model (the way
+TrOCR's encoder is), rather than only as an external post-process
+(`ocr_refine.py`, already built, see "Two different things both called
+OCR" below). Initial answer given in-conversation was "no, different
+architecture families can't be spliced together" -- **that answer was
+pushed back on, correctly, and turned out to be an oversimplification**.
+Mid-correction when this doc was handed off:
+
+- Real PyTorch ports of PaddleOCR/PP-OCR exist and were verified via web
+  search (not yet hands-on tested): `frotms/PaddleOCR2Pytorch` (inference
+  code) + `JoyCN/PaddleOCR-Pytorch` on HuggingFace (weights in safetensors,
+  described as "converted bit-exactly from the official PaddlePaddle
+  .pdparams... inference outputs are identical to the original PaddleOCR
+  down to float32 precision"). This means the weights genuinely could be
+  loaded as real `nn.Module` layers with real gradients -- "different
+  framework" is not actually a blocker.
+- The real remaining design question is **input format, not architecture
+  family**: PP-OCR's recognition backbone (CNN, e.g. PPLCNetV4) is built
+  to take roughly-single-line, pre-cropped text regions, not a whole
+  padded-square diagram image the way TrOCR's ViT patches happily do. Two
+  concrete design options to evaluate, neither implemented yet:
+  1. **Dual-encoder**: run PP-OCR's CNN backbone on the *whole* image in
+     parallel with TrOCR's ViT (fully-convolutional backbones tolerate
+     varying input resolution), concatenate both into the decoder's
+     cross-attention memory. No bounding boxes needed. Unverified whether
+     features computed this way (whole-image input instead of the
+     cropped-line input it was trained on) actually retain useful signal.
+  2. **Detection + crop + recognize**: bring back a per-label bounding-box
+     step (could even reuse PP-OCR's own *detection* model, also portable
+     to PyTorch via the same conversion project), crop each region to the
+     format PP-OCR's recognizer actually expects, and feed that in as an
+     auxiliary signal. More faithful to how PP-OCR was trained, more
+     invasive to the current architecture (reintroduces bounding boxes,
+     which the seq2seq design deliberately avoided -- see "Why this
+     architecture" further down).
+- **Nothing here has been hands-on verified yet** -- no one has actually
+  loaded `PaddleOCR2Pytorch` + the `JoyCN` weights and inspected real
+  tensor shapes coming out of the CNN backbone. That's the concrete next
+  step before picking between option 1 and 2 above, or deciding this isn't
+  worth the complexity until the vocabulary-fix retrain results are in.
+
+**Also still open / not yet done**: `train_reconstructor.py` has zero
+image-level data augmentation (no rotation/color-jitter/noise at load
+time) unlike `train_router.py` which has some. Flagged as a possible
+contributor to the overfitting seen in the first training run (`val_loss`
+got worse after epoch ~10 while `train_loss` kept dropping). Not
+implemented yet, pending the same vocabulary-fix results before deciding
+if it's needed.
+
+---
+
 ## The core idea (in one line)
 
 Replace the ImageNet-pretrained ViT-Tiny encoder with the pretrained
