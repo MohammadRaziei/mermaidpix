@@ -117,6 +117,65 @@ flowchart TD
 loaded from TrOCR but fine-tuned (small learning rate) · blue = trained
 from scratch (normal/higher learning rate).
 
+## Two different things both called "OCR" here — don't confuse them
+
+This confusion is fair to have, so worth being completely explicit about.
+There are **two separate OCR-related components** in this project, and
+they play fundamentally different roles:
+
+| | TrOCR's BEiT-Base encoder | PP-OCRv6 / `pyturboocr` |
+|---|---|---|
+| **Where it lives** | *Inside* `model.py` -- literally the first half of `MermaidReconstructor` | A completely separate package, only touched by `ocr_refine.py` |
+| **Is it part of training?** | **Yes.** Its weights (the unfrozen 8 of 12 blocks) get gradient updates every training step, same as the decoder | **No.** Never touched by `train_reconstructor.py`. Not differentiable, not in the computation graph, contributes zero gradients |
+| **Is it frozen?** | Partially -- bottom 4 blocks frozen, top 8 fine-tuned (exactly the "freeze some layers, train the rest" idea from earlier in this conversation) | N/A -- it's not a layer in our model at all, so "frozen" doesn't apply. It's a whole separate program we call as a subprocess/library call |
+| **What it outputs** | A feature vector (768-dim per image patch) that the decoder cross-attends to -- not text | Actual text strings + bounding boxes, directly |
+| **When does it run?** | Every training step *and* every inference call -- it's load-bearing, the model doesn't work without it | Only if you explicitly run `ocr_refine.py` -- optional, after the reconstructor already produced an answer |
+| **Required?** | **Yes**, absolutely core to the architecture | **No**, purely experimental/optional |
+
+**So to directly answer "did you use it as a frozen layer inside
+training?"**: that's exactly what happened with **TrOCR's encoder**
+(partially frozen, partially fine-tuned, fully inside the trained model).
+It's *not* what happens with **PP-OCRv6/pyturboocr** -- and the reason
+isn't a choice to leave it out, it's an architectural incompatibility:
+PP-OCRv6 is a CNN+CTC-based detector/recognizer (a completely different
+model family from our ViT-based transformer encoder-decoder). You can't
+freeze a few of its layers and bolt them into a transformer the way TrOCR's
+BEiT blocks slot in -- there's no shared tensor shape or computational
+structure to splice at. TrOCR worked as a frozen-layer donor because it's
+architecturally the same *kind* of thing we already have (a ViT-style
+transformer encoder). PP-OCRv6 isn't, so the only way to use it at all is
+as a separate program whose text *output* gets merged in afterward -- which
+is exactly what `ocr_refine.py` does.
+
+```mermaid
+flowchart TD
+    subgraph TRAINING["Training + normal inference (model.py, train_reconstructor.py, infer.py) — REQUIRED"]
+        direction LR
+        IMG1["image"] --> ENC["TrOCR BEiT-Base encoder<br/>(partially frozen, partially fine-tuned)<br/>INSIDE the model, gets gradients"]
+        ENC --> DEC["Custom decoder<br/>(trained from scratch)"]
+        DEC --> CODE1["Mermaid code<br/>(structure: correct: labels: sometimes wrong)"]
+    end
+
+    subgraph POSTPROCESS["Optional post-process (ocr_refine.py) — NOT required, experimental"]
+        direction LR
+        IMG2["same image"] -.->|"separate program,<br/>not part of training,<br/>zero gradients"| PPOCR["PP-OCRv6 / pyturboocr<br/>(CNN+CTC, different model family<br/>-- can't be frozen INTO the transformer above)"]
+        PPOCR --> TEXTS["Raw text strings<br/>+ bounding boxes"]
+        CODE1 -.-> MATCH["Match by reading order<br/>(heuristic, no bbox on the<br/>reconstructor side to match against)"]
+        TEXTS -.-> MATCH
+        MATCH --> CODE2["Refined Mermaid code<br/>(labels substituted)"]
+    end
+
+    style ENC fill:#c8e6c9,stroke:#2e7d32
+    style DEC fill:#bbdefb,stroke:#1565c0
+    style PPOCR fill:#fff3cd,stroke:#997404
+    style MATCH fill:#fff3cd,stroke:#997404
+```
+
+The dashed arrows in the second box are deliberate -- they cross from the
+trained pipeline's *output* into a separate script, not from inside the
+model. Nothing about `pyturboocr` ever appears inside `model.py` or
+`train_reconstructor.py`.
+
 ## Frozen vs. trainable — exact layer list
 
 | Component | Source | Status | Learning rate |
