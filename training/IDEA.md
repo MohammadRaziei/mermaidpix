@@ -256,102 +256,132 @@ needs to be. If it barely moves, that points toward a harder problem
 (e.g. label text is too small/low-resolution for the encoder to resolve
 individual characters reliably) that a bigger vocabulary alone won't fix.
 
-## Fallback plan if the vocabulary fix isn't enough: PP-OCRv6 hybrid
+## Fallback plan if the vocabulary fix isn't enough: PP-OCRv6 (not TurboOCR itself)
 
-You pointed me at [TurboOCR](https://github.com/aiptimizer/TurboOCR), a C++/TensorRT
-inference server bundling Baidu's **PP-OCRv6** models (text detection +
-recognition + layout + table + formula -> Markdown). Evaluated it as a
-candidate fix for the label-hallucination problem above.
+You pointed me at [TurboOCR](https://github.com/aiptimizer/TurboOCR) as a
+candidate fix for the label-hallucination problem above, then did real
+hands-on research (built a package, hit real bugs, benchmarked it) that
+substantially corrected my initial read of it. Summarizing what changed:
 
-**Not usable directly**: TurboOCR is a deployment product, not something
-you import into a PyTorch training loop. It also has no concept of
-"Mermaid diagram" / "arrow" / "decision node" -- it reads general
-documents into text + tables, not diagram graph structure.
+**Correction to what I said earlier**: I'd credited TurboOCR with "already
+did the ONNX conversion work" as a reason it was worth the Docker/GPU/
+TensorRT overhead. That's wrong. TurboOCR doesn't convert or train
+anything -- it downloads the public **PP-OCRv6** weights (Baidu/
+PaddlePaddle, Apache-2.0, released 2026-06-11) and re-hosts them on its own
+GitHub Release, behind a C++/CUDA/TensorRT server built for production
+throughput. The model itself is identical to what you'd get from the
+official `paddleocr` package, which has supported an `engine="onnxruntime"`
+mode -- pure Python, no server, no GPU required -- since the same release
+day. So the TurboOCR *server* isn't the right unit of comparison for this
+project at all; the right question is just "how do we run PP-OCRv6 in
+Python," and there were always simpler answers to that than standing up
+TurboOCR's Docker/TensorRT server.
 
-**No C++ binding needed, though** -- it's already a server (HTTP on
-`:8000` + gRPC on `:50051`), not a raw library. Integration from Python is
-just an HTTP call, nothing to compile or link:
+**The one genuinely useful thing this investigation surfaced**: where the
+model weights are hosted matters more than which wrapper you use, if
+you're behind a restricted network (true of my own sandbox, possibly true
+of wherever this eventually deploys):
 
-```python
-import requests
+| Package | Model weights come from | Works with GitHub-only network access? |
+|---|---|---|
+| `paddleocr` (official) | HuggingFace / ModelScope / AIStudio / Baidu BOS | No |
+| RapidOCR | Mostly HuggingFace/GitHub; some tiers from ModelScope | Partially, tier-dependent |
+| `pyturboocr` (the package built during this research) | GitHub Release only | **Yes** |
 
-with open("diagram.png", "rb") as f:
-    resp = requests.post("http://localhost:8000/ocr/raw", data=f.read(),
-                          headers={"Content-Type": "image/png"})
-# [{"text": "Invoice Total", "confidence": 0.97,
-#   "bounding_box": [[42,10],[210,10],[210,38],[42,38]]}, ...]
-results = resp.json()["results"]
+**I verified this myself, independently, in this sandbox** (which only
+allows a handful of domains including GitHub, not HuggingFace):
+
 ```
+pip install pyturboocr   # succeeded -- pulls weights from a GitHub Release
+```
+```python
+from pyturboocr import OCR
+ocr = OCR(tier="tiny")                          # load: 1.70s (incl. first download)
+result = ocr.recognize_image("test_invoice.png") # inference: 0.157s for 3 lines
 
-Each result already has a `bounding_box` + `text` + `confidence` -- exactly
-the shape needed for the crop/match/substitute design below. A `proto/`
-folder is also in the repo, so a native gRPC client is generatable via
-`grpcio-tools` if HTTP overhead ever matters; not needed to get started.
+# "Total: 540.00 USD"    confidence=0.979  -- correct
+# "ACME Corp Invoice"    confidence=0.997  -- correct
+# "Iterm: Widget A"      confidence=0.940  -- WRONG, should be "Item" (one extra char)
+```
+Confidences are in a sane range (not near-zero -- confirms the
+double-softmax bug your research found and fixed is actually fixed) and
+box coordinates stayed within the image bounds (confirms the unclip-fallback
+bug fix too). But it's not perfect -- one real recognition error out of
+three lines on a clean synthetic image, worth keeping in mind as a realistic
+error rate rather than assuming "pretrained OCR" means "solved."
 
-**Real blocker to check before going further down this path**: TurboOCR's
-Docker image requires **Linux + NVIDIA GPU (Turing or newer) + driver
-595+** (`docker run --gpus all ...`). Your `make install` output earlier
-showed `CUDA available: False` -- if that's still the case, this server
-won't start at all until that's resolved (driver install, or confirming
-whether the machine actually has an NVIDIA GPU). Worth resolving that
-question on its own regardless of this fallback, since GPU-less training
-of the ~105M-param reconstructor is also going to be very slow.
+**Practical recommendation, layered by network access** (matches your
+report's conclusion): if the deployment environment can reach HuggingFace/
+ModelScope/Baidu BOS, use official `paddleocr` with
+`engine="onnxruntime"` -- it's the reference implementation, most
+authoritative, most actively maintained. If it's restricted to GitHub/PyPI
+only (true here, possibly true elsewhere), `pyturboocr` is a real, tested
+option -- small dependency footprint (`onnxruntime`, `shapely`,
+`pyclipper`, `pillow`, `requests`), no GPU/Docker/driver requirement at
+all (a simpler bar to clear than the TurboOCR server I originally
+described, which needs Linux + NVIDIA GPU + driver 595+). The official
+package itself remains unverified end-to-end by either of us so far
+(blocked in my sandbox same as yours) -- still worth running once on a
+machine with normal internet access, since it's the one result that would
+carry the most weight if it disagrees with `pyturboocr`'s numbers.
 
-**Lighter alternative if the GPU/driver situation doesn't resolve
-quickly**: PaddleOCR publishes the underlying PP-OCRv6 detection +
-recognition weights as standalone ONNX files in their own model zoo
-(TurboOCR's `fetch_release_models.sh` pulls from there rather than
-shipping its own weights). Those could in principle be run directly with
-`onnxruntime` in plain Python -- CPU-compatible, no Docker, no TensorRT,
-no GPU driver -- at the cost of losing TurboOCR's engineering (TensorRT
-FP16 optimization, batching, layout/table/formula stages, the whole
-served-API convenience). **I haven't verified the exact download
-location/filenames for these standalone weights** -- worth a quick check
-before assuming this path is as simple as it sounds.
-
-**What IS relevant regardless of which path**: the actual model sizes:
+**What's relevant regardless of which wrapper**: the actual model sizes:
 
 | Component | Sizes across tiers |
 |---|---|
 | Text detection | 1.7 / 9.4 / 59 MB |
 | Text recognition | **4.3** / 20 / 73 MB |
 
-This is a stronger, more targeted version of the exact idea behind the
-TrOCR encoder swap earlier in this doc -- a model pretrained specifically
-to read text, not classify ImageNet photos -- but at **~20x smaller**
-(4.3MB vs. BEiT-Base's 86M-param encoder) while still benchmarking well
-above 90% word-F1 on real-world forms/receipts (FUNSD, CORD).
+Still a stronger, more targeted version of the idea behind the TrOCR
+encoder swap earlier in this doc -- pretrained specifically to read text,
+not classify ImageNet photos -- at ~20x smaller than BEiT-Base's 86M-param
+encoder, with real (if imperfect, per the "Iterm" typo above) accuracy on
+this sandbox's own test.
 
-**Why this wasn't implemented instead of the vocabulary fix**: it's a real
-architecture change (a second model, a second inference pass, and --
-critically -- it needs each label's *bounding box* to crop and OCR
+**Why this wasn't implemented instead of the vocabulary fix**: still a real
+architecture change -- a second model, a second inference pass, and,
+critically, it needs each label's *bounding box* to crop and OCR
 individually, which the current seq2seq design deliberately doesn't
-produce; see "Why this architecture" at the top of this doc for why we
-moved away from per-element bounding boxes in the first place). The
-vocabulary fix costs nothing architecturally and directly tests whether
-the problem is "the model exploited low label entropy" (data problem) vs.
-"the model genuinely can't resolve small text" (capability problem) --
-worth knowing which one it is before deciding whether a second OCR model
-and a return to bounding-box-style outputs is actually necessary.
+produce (see "Why this architecture" at the top of this doc for why we
+moved away from per-element bounding boxes). The vocabulary fix costs
+nothing architecturally and directly tests whether the problem is "the
+model exploited low label entropy" (data problem) vs. "the model genuinely
+can't resolve small text" (capability problem) -- worth knowing which one
+it is before deciding whether a second OCR model and a return to
+bounding-box outputs is actually necessary.
 
 **If the vocabulary fix doesn't move the needle**, the concrete hybrid
-design would be:
+design:
 - Keep the current reconstructor for structure (shapes, edges, branch
   labels) -- it already gets this right.
-- Run PP-OCRv6 detection (via TurboOCR's `/ocr/raw`, or the standalone
-  ONNX path above) to find every label's bounding box in the original
-  image (a new capability -- current architecture has no detection step
-  at all).
-- Recognition is bundled into that same `/ocr/raw` response -- no separate
-  crop-and-recognize step needed if using TurboOCR's API directly.
+- Run PP-OCRv6 detection+recognition (via `pyturboocr` or official
+  `paddleocr`, whichever the deployment network allows) to get every
+  label's bounding box + text directly -- both come back together in one
+  call, no separate crop-and-recognize step needed.
 - Match each returned text box to the nearest node/edge the reconstructor
   emitted (by position), and substitute in the OCR'd text in place of
   whatever label the decoder generated.
 
-This is a bigger change (new detection+matching step, a second service
-dependency, a hard GPU/driver requirement if going the TurboOCR-server
-route) than anything else in this document so far, which is why it's
+This is a bigger change (new detection+matching step, a second model
+dependency) than anything else in this document so far, which is why it's
 parked as a fallback rather than implemented alongside the vocabulary fix.
+
+**Update: implemented as an optional, separate script** (`ocr_refine.py`)
+rather than folded into the core pipeline, specifically so it doesn't
+contaminate the vocabulary-fix experiment above -- run both independently
+and compare. One real design gap surfaced while writing it: the current
+reconstructor has no per-label bounding boxes to match OCR results
+against (that's the whole point of the seq2seq design), so
+`ocr_refine.py` matches by **reading order** (top-to-bottom, then
+left-to-right) instead of position -- a heuristic, not a guarantee. It
+works cleanly when the reconstructor's label count matches the OCR'd text
+count; when they don't match (e.g. OCR also picks up edge labels like
+"Yes"/"No" that the matching doesn't currently account for), the script
+says so explicitly rather than silently producing a misaligned result.
+Verified the two pure functions (`substitute_labels`,
+`ocr_labels_in_reading_order`) directly in this sandbox against a real
+synthetic invoice image -- substitution logic is correct, and OCR results
+came back in the expected top-to-bottom order.
 
 ## Bugs found and fixed (via your actual test run)
 

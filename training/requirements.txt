@@ -11,3 +11,8 @@ tokenizers>=0.20
 torch>=2.2
 torchvision>=0.17
 transformers>=4.40
+
+# Optional -- only needed for ocr_refine.py (experimental label-correction
+# post-process, see IDEA.md "Fallback plan"). Not required for the core
+# generate/tokenize/train/infer pipeline.
+# pyturboocr
