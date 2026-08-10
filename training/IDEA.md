@@ -605,3 +605,139 @@ came back in the expected top-to-bottom order.
   the table above.
 - `requirements.txt`: add `transformers`, drop `timm` (no longer used once
   the encoder comes from `transformers` instead).
+
+## Future work: render-based (execution) reward for fine-tuning the reconstructor
+
+**Idea, not yet implemented.** After the supervised (teacher-forcing,
+cross-entropy) phase converges, add a second fine-tuning phase that closes
+the loop through the *actual* task metric: sample Mermaid code from the
+decoder, render it with `mermaidx` -- the same function used to build
+every training/val image in this pipeline -- and reward the model by how
+close that render is to the ground-truth image, instead of only rewarding
+token-level next-token accuracy.
+
+**Why this needs RL (REINFORCE / SCST), not a differentiable loss.** The
+chain `decoder logits -> sampled/argmax token ids -> decoded text ->
+mermaidx.render() -> pixels` is not differentiable end to end: turning
+logits into discrete token ids has no gradient, and `mermaidx`'s
+JS-based layout engine (running through the embedded QuickJS interpreter)
+has none either. So `loss.backward()` cannot flow from a pixel comparison
+back into the decoder's logits directly. The standard fix, used for
+exactly this kind of situation in image-captioning (Self-Critical Sequence
+Training / SCST) and in execution-based code-generation reward more
+generally:
+1. *Sample* (don't argmax) a full sequence from the decoder for a training
+   image.
+2. Render the sampled sequence, compare against the ground-truth render,
+   and turn that comparison into a scalar reward (not a loss).
+3. Subtract a baseline -- e.g. the reward of the same model's *greedy*
+   decode on the same input -- to reduce variance (this is what makes it
+   "self-critical": the model's own greedy output is the baseline it's
+   compared against).
+4. Backpropagate `-log_prob(sampled_sequence) * (reward - baseline)`
+   (REINFORCE) through the decoder -- this part *is* differentiable,
+   since `log_prob` is a normal function of the logits.
+
+**On the pixel-comparison objection raised in conversation, and the
+correction to it.** I initially flagged "raw pixel comparison is risky."
+The pushback was: both the sampled render and the ground-truth render are
+outputs of the same deterministic function, `mermaidx.render()`, given the
+same input text they cannot differ -- correct, and worth stating plainly:
+for an exact text match, the reward is trivially and reliably 1 (bit-for-bit
+identical renders), no ambiguity there. The actual, narrower concern this
+doesn't resolve is about *near-misses*, not exact matches: Mermaid's
+auto-layout engine sizes nodes based on label text (width often scales
+with character count), so a single wrong character in a label can still
+render successfully while shifting box boundaries, which cascades into
+different edge routing and downstream node positions. That means a small,
+fully deterministic and reproducible text error can produce a
+disproportionately large pixel difference -- reliable as an exact-match
+detector, but potentially noisy as a source of *graded* partial credit for
+near-misses, which is usually the point of using a continuous
+pixel-based reward instead of a binary one.
+
+**Reward function options (cheapest to most informative), not yet decided:**
+1. **Binary "rendered without error."** No pixel comparison at all --
+   just `reward = 1 if mermaidx.render(sampled_text) succeeds else 0`.
+   Cheapest option and directly targets a real, previously-observed
+   failure mode (hallucinated syntax that doesn't parse/render), without
+   needing any image comparison machinery.
+2. **Structural-similarity (SSIM-style) pixel reward** for graded credit
+   beyond "did it render at all" -- softer to the layout-cascade effect
+   above than raw per-pixel MSE would be, though not immune to it.
+
+**Cost, and why this can't run every training step** (also raised in
+conversation, agreed on): REINFORCE-style methods typically need multiple
+samples per example to keep variance manageable (commonly 4-8), each
+requiring its own render -- measured render cost in this repo is
+~0.1-0.95s (~0.3s avg, see `train_reconstructor.py`'s `SpoolQueue`
+testing notes), so a single training example could cost multiple seconds
+of rendering alone. This should run as an occasional fine-tuning phase
+*after* the supervised phase converges (matching standard SCST practice:
+cross-entropy pretrain, then RL fine-tune), not interleaved into every
+batch of the main training loop.
+
+**Open questions for whoever picks this up:** how many samples per example
+is actually enough to keep variance manageable here; whether SSIM
+meaningfully outperforms plain binary-render-success given the extra
+compute cost; how to weight this reward against the ongoing token-level
+cross-entropy loss (pure RL from scratch is notoriously unstable -- a
+mixed objective is the usual answer, but the mixing weight isn't obvious
+a priori); and whether `mermaidx` rendering is fast/stable enough under
+the concurrent load this would add on top of the on-the-fly `SpoolQueue`
+producers already running. Not implemented, not estimated, no code
+written yet.
+
+## Future work: feed the router's diagram_type prediction into the reconstructor as conditioning
+
+**Idea, not yet implemented.** Confirmed by rereading `model.py` and
+`infer.py` in conversation: the router and reconstructor are two fully
+independent models today, chained only through a binary gate --
+
+```python
+diagram_type, confidence = route(image, router, classes, device)
+if diagram_type == "not_diagram":
+    return   # the ONLY thing diagram_type is ever used for
+mermaid_code = reconstruct(image, reconstructor, tokenizer, device)
+```
+
+`MermaidReconstructor.forward(images, decoder_input_ids)` has no parameter
+for diagram type at all -- once past the not-a-diagram gate, the router's
+prediction (which diagram type, and how confidently) is thrown away, and
+the reconstructor has to infer the diagram type on its own, purely from
+pixels, at every generation step, including the very first token before
+any syntax-defining keyword has been produced yet.
+
+**Idea:** pass the router's diagram_type prediction into the reconstructor
+as an explicit conditioning signal, narrowing what the decoder has to
+figure out from scratch. A few mechanisms, not yet chosen between:
+1. **Prepend a conditioning token.** A learned embedding per diagram_type
+   (one of the 29 classes) placed as the decoder's first input position
+   (instead of, or alongside, `<s>`), so every later self-attention step
+   can attend back to it.
+2. **Inject into the encoder memory.** Broadcast-add a diagram_type
+   embedding onto every patch token (or append it as one extra memory
+   token), so the decoder's cross-attention has access to it at every
+   step, not just position 0.
+3. **Fold into `enc_proj`.** Concatenate the diagram_type embedding with
+   the visual features before the existing `enc_proj` linear layer, so it
+   becomes part of the same memory tensor the decoder already
+   cross-attends to -- structurally the smallest change to `model.py`.
+
+**Rationale.** The valid-syntax space differs a lot across the 29 diagram
+types (`sequenceDiagram` syntax shares almost nothing with `flowchart`
+beyond punctuation); telling the decoder "this is a sequenceDiagram" up
+front removes an ambiguity it currently has to resolve purely from pixels.
+
+**Open questions, not yet resolved:** whether to condition on the router's
+hard argmax class or its full softmax distribution (a soft embedding could
+let the reconstructor partially discount a low-confidence router call
+instead of trusting it blindly); a **train/inference mismatch** to design
+around explicitly -- during training the ground-truth diagram_type from
+the generator is known and free to use, but at real inference time only
+the router's (possibly wrong) prediction is available, so training should
+probably not always feed the ground-truth type uncritically, or the
+reconstructor may never learn to be robust to a wrong router call (e.g.
+mix in the router's actual prediction some fraction of training steps, or
+add label noise to the ground-truth conditioning signal, to be decided).
+Not implemented, no code written yet.
