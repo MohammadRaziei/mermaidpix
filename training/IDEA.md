@@ -654,7 +654,13 @@ fully deterministic and reproducible text error can produce a
 disproportionately large pixel difference -- reliable as an exact-match
 detector, but potentially noisy as a source of *graded* partial credit for
 near-misses, which is usually the point of using a continuous
-pixel-based reward instead of a binary one.
+pixel-based reward instead of a binary one. **This isn't just a hunch --
+see `literature.md` section 4: RLRF (NeurIPS 2025), the closest published
+technique to this idea, deliberately does NOT use raw pixel L2 alone for
+exactly this kind of task (SVG generation with non-differentiable
+rendering); its reward combines L2 with a semantic-similarity term
+(DreamSim/CLIP) precisely because raw pixel distance alone is understood
+in that literature to be a fragile signal for near-misses.**
 
 **Reward function options (cheapest to most informative), not yet decided:**
 1. **Binary "rendered without error."** No pixel comparison at all --
@@ -686,7 +692,10 @@ mixed objective is the usual answer, but the mixing weight isn't obvious
 a priori); and whether `mermaidx` rendering is fast/stable enough under
 the concurrent load this would add on top of the on-the-fly `SpoolQueue`
 producers already running. Not implemented, not estimated, no code
-written yet.
+written yet. **See `literature.md` section 4 for two directly relevant
+published techniques (RLRF, RefineSVG) doing this exact SFT-then-RL,
+rendering-feedback approach for a different non-differentiable markup
+target (SVG) -- worth reading before implementing this.**
 
 ## Future work: feed the router's diagram_type prediction into the reconstructor as conditioning
 
