@@ -750,3 +750,71 @@ reconstructor may never learn to be robust to a wrong router call (e.g.
 mix in the router's actual prediction some fraction of training steps, or
 add label noise to the ground-truth conditioning signal, to be decided).
 Not implemented, no code written yet.
+
+## Future work: evaluate on FlowVQA as an out-of-distribution check
+
+**Idea, not yet implemented.** Every image this model has ever been
+trained *or* validated on -- on-the-fly (`SpoolQueue`) or fixed-manifest,
+doesn't matter -- comes from `mermaidx`'s own renderer: same fonts, same
+layout engine, same rendering quirks. That means the current val_loss /
+val_token_acc / exact-match numbers can only ever tell you how well the
+model reads `mermaidx`'s particular visual style, never whether it
+generalizes to a flowchart image rendered by something else entirely (a
+different Mermaid renderer version, a hand-drawn sketch, a screenshot from
+a different tool).
+
+FlowVQA (Singh et al. 2024, see `literature.md` section 1) -- the dataset
+Flowchart2Mermaid evaluates against -- is real-world flowchart images with
+step-level annotations, not mermaidx output. Running this project's
+trained reconstructor against a FlowVQA subset (even without fine-tuning
+on it) would be a genuinely independent signal: if accuracy holds up
+reasonably, the model learned real diagram-reading, not mermaidx-specific
+pattern matching; if it collapses, that's the on-the-fly training data's
+lack of visual diversity (single renderer, one font/theme family per
+`common/diagram_generators.py`'s theme list) showing up as a real
+generalization gap, distinct from anything a bigger training run alone
+would fix.
+
+**Open questions:** FlowVQA's diagrams and annotation format weren't
+built with Mermaid in mind (Flowchart2Mermaid had to adapt its Mermaid
+representations for evaluation purposes -- see their paper), so some
+adaptation work is needed before this project's tokenizer/model could be
+pointed at it directly; also worth deciding whether this becomes a
+one-time generalization sanity check or a recurring eval alongside the
+mermaidx-based val set. Not implemented, no code written yet.
+
+## Future work: node/edge-set structural metric, not just exact-match
+
+**Idea, not yet implemented.** `train_reconstructor.py`'s
+`qualitative_samples` currently only measures token-level accuracy and
+exact-string match against the target. That's a harsh, brittle metric:
+two Mermaid programs that use different node IDs (`A[Start]` vs
+`Node1[Start]`), different bracket styles for the same shape, or
+different quote characters are structurally and semantically identical
+but would score as a complete miss under exact-match, even though a human
+reading both would call them the same diagram.
+
+Flowchart2Mermaid (see `literature.md` section 1) uses a more forgiving,
+more informative metric for exactly this reason: extract the node set and
+the directed-edge set from both the predicted and gold Mermaid code
+(normalizing away IDs, shape brackets, and quote style), then compute
+precision/recall/F1 on nodes and on edges separately. Adopting something
+similar here -- even a lightweight, non-LLM-judge version, since this
+project's Mermaid sources are generated from known templates in
+`common/diagram_generators.py` rather than arbitrary real-world text, so
+a simpler rule-based parser might suffice instead of Flowchart2Mermaid's
+LLM-judge approach -- would give a much clearer picture of whether the
+model is getting the *content* right versus only getting the *exact
+tokenization* right, and would likely reveal the model performs better
+than exact-match currently suggests.
+
+**Open questions:** whether a simple regex/rule-based node/edge extractor
+is reliable enough across all 29 diagram types (their syntax families
+differ a lot -- see `IDEA.md`'s "Two different things both called OCR"
+section for a sense of how varied Mermaid's syntax space is) or whether
+it needs to be closer to Flowchart2Mermaid's LLM-judge approach for the
+harder diagram types; and whether this should replace or just supplement
+the existing exact-match metric (exact-match still matters for
+`infer.py`'s real usage, where round-trippable syntax the user can render
+without any manual fixing is the actual goal, not just "close enough").
+Not implemented, no code written yet.
