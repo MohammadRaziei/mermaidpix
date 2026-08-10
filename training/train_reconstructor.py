@@ -19,15 +19,18 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import multiprocessing as mp
+import os
 import random
+import shutil
+import time
 from pathlib import Path
 
-import mermaidx
 import torch
 import torch.nn as nn
 from PIL import Image, ImageOps
 from tokenizers import ByteLevelBPETokenizer
-from torch.utils.data import Dataset, IterableDataset, DataLoader, get_worker_info
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from transformers import AutoImageProcessor
 
@@ -49,22 +52,30 @@ from common.diagram_generators import (
 # (a flipped flowchart arrow reverses its real meaning).
 #
 # NOTE 2 -- bigger change, added in the same pass: TRAIN now defaults to
-# on-the-fly generation (OnTheFlyReconstructorDataset below) instead of
-# reading a fixed, pre-rendered manifest. This attacks the label-
-# hallucination problem IDEA.md diagnosed at its root: with a *finite* set
-# of pre-rendered images, the model can partially memorize "this exact PNG
-# says X" instead of reading pixels, no matter how large the label
-# vocabulary is. Rendering a fresh random diagram (new text, new node/edge
-# topology, new theme/look) per sample via mermaidx -- which is pure-Python
-# and browserless, so this is cheap enough to do in the data-loading path --
-# makes that shortcut unavailable: no two training samples are ever the same
-# image twice. VAL deliberately stays on the old fixed manifest (see
-# ReconstructorDataset below) -- metrics need to be measured on the same
-# held-out examples every epoch to be comparable across epochs and runs; an
-# ever-changing val set would make the val_loss curve meaningless. The old
-# fixed-manifest training path is kept available via --no-on-the-fly for
-# direct before/after comparison, since this hasn't been validated with a
-# real training run yet (see README "What's tested").
+# on-the-fly generation instead of reading a fixed, pre-rendered manifest.
+# This attacks the label-hallucination problem IDEA.md diagnosed at its
+# root: with a *finite* set of pre-rendered images, the model can partially
+# memorize "this exact PNG says X" instead of reading pixels, no matter how
+# large the label vocabulary is. Rendering a fresh random diagram (new
+# text, new node/edge topology, new theme/look) per sample via mermaidx
+# makes that shortcut unavailable. VAL deliberately stays on the old fixed
+# manifest (see ReconstructorDataset below) -- metrics need to be measured
+# on the same held-out examples every epoch to be comparable across epochs
+# and runs. The old fixed-manifest training path is kept available via
+# --no-on-the-fly for direct before/after comparison.
+#
+# NOTE 3 -- on-the-fly is implemented as a disk-backed spool queue
+# (SpoolQueue below), not a plain DataLoader(num_workers=N). Requested in
+# conversation specifically so a *separate, independent* process can watch
+# what's actually queued for training without touching the trainer at all:
+# N producer OS processes each independently render diagrams and write them
+# as (png, json) file pairs into a small directory; this process reads and
+# immediately deletes each pair the moment it consumes it. That directory's
+# current contents ARE the live queue -- its depth is just a file count,
+# and a read-only inspector (see inspect_on_the_fly.py) can list/open those
+# files at any time, live, with zero IPC into the trainer. This trades a
+# small amount of disk I/O (write+read a PNG instead of passing a tensor
+# through DataLoader's internal shared-memory queue) for that transparency.
 
 from model import MermaidReconstructor
 
@@ -180,69 +191,186 @@ class ReconstructorDataset(Dataset):
         return img_tensor, torch.tensor(ids, dtype=torch.long)
 
 
-class OnTheFlyReconstructorDataset(IterableDataset):
-    """Renders a fresh random diagram per sample instead of reading a
-    pre-rendered manifest -- see the NOTE 2 block at the top of this file
-    for why. Infinite by design (the point is that no two samples repeat),
-    so unlike ReconstructorDataset it has no __len__/epoch boundary; the
-    caller decides how many samples make up one "epoch" via --steps-per-
-    epoch and pulls that many batches from a persistent iterator (see
-    main() below) rather than looping until StopIteration.
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write-then-rename so a reader (the trainer, or an independent
+    inspector process) can never open a half-written file: os.replace is
+    atomic on the same filesystem, so `path` only ever appears once it's
+    fully written."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def _spool_producer_loop(
+    spool_dir: Path,
+    seed: int,
+    worker_id: int,
+    max_queue_samples: int,
+    render_widths: tuple[int, ...],
+    poll_interval: float,
+    stop_event,
+) -> None:
+    """Runs in its own OS process (spawned by SpoolQueue.start). Endlessly
+    renders fresh random diagrams and writes each as a (png, json) file
+    pair into `spool_dir` -- that directory IS the queue: a file existing
+    there means "queued, not yet consumed"; the trainer deletes a pair the
+    moment it reads it (see SpoolQueue.get_batch). A separate, read-only
+    process can inspect exactly what's queued, right now, just by listing
+    this directory -- see inspect_on_the_fly.py.
+
+    Backpressure: if the directory already holds >= max_queue_samples
+    pending pairs, this just polls and waits instead of rendering more, so
+    a slow GPU step can't make disk usage grow without bound.
+    """
+    # Imported HERE, not at module top-level: this must be the first thing
+    # that touches mermaidx in this process. Tested in conversation --
+    # importing mermaidx in the PARENT before forking children looked at
+    # first like it deadlocked every child (0 output for 30+ seconds); it
+    # turned out to actually just be single-core CPU contention between
+    # N processes' ~9s QuickJS warmup on a constrained sandbox, not a real
+    # fork hazard -- but keeping the import local costs nothing and is the
+    # safer default regardless of what other libraries end up sharing this
+    # process in the future.
+    import mermaidx
+
+    rng = random.Random(seed * 1_000_003 + worker_id)
+    diagram_types = list(DIAGRAM_BUILDERS.keys())
+    counter = 0
+    while not stop_event.is_set():
+        pending = sum(1 for _ in spool_dir.glob("*.png"))
+        if pending >= max_queue_samples:
+            time.sleep(poll_interval)
+            continue
+
+        diagram_type = rng.choice(diagram_types)
+        src = DIAGRAM_BUILDERS[diagram_type](rng)
+        theme, look = random_theme_and_look(rng)
+        wrapped = wrap_with_frontmatter(src, theme, look)
+        width = rng.choice(render_widths)
+
+        try:
+            diagram = mermaidx.render(wrapped)
+            png_bytes = diagram.png(width=width, background="#ffffff")
+        except Exception:
+            # A bad random sample shouldn't kill the producer -- same
+            # "skip and keep going" policy generate_dataset.py uses.
+            continue
+        if png_bytes is None:
+            continue
+
+        counter += 1
+        base = f"w{worker_id:02d}_{counter:08d}_{time.time_ns()}"
+        meta = {
+            "diagram_type": diagram_type, "theme": theme, "look": look,
+            "width": width, "target": src, "worker_id": worker_id,
+            "written_at": time.time(),
+        }
+        try:
+            _atomic_write(spool_dir / f"{base}.png", png_bytes)
+            _atomic_write(spool_dir / f"{base}.json", json.dumps(meta).encode("utf-8"))
+        except OSError:
+            # e.g. disk hiccup -- drop this one sample, keep the producer alive
+            continue
+
+
+class SpoolQueue:
+    """Disk-backed producer/consumer queue for on-the-fly training data --
+    see NOTE 3 near the top of this file for the reasoning. `num_workers`
+    producer processes fill `spool_dir`; get_batch() (called from the main
+    training process) reads and deletes files as it consumes them.
     """
 
     def __init__(
         self,
+        spool_dir: Path,
         tokenizer: ByteLevelBPETokenizer,
         transform: transforms.Compose,
-        max_len: int = 640,
+        num_workers: int,
+        queue_depth_batches: int,
+        batch_size: int,
         seed: int = 0,
+        max_len: int = 640,
+        poll_interval: float = 0.05,
         render_widths: tuple[int, ...] = (600, 800, 1000),
     ):
+        self.spool_dir = spool_dir
         self.tokenizer = tokenizer
         self.transform = transform
         self.max_len = max_len
-        self.seed = seed
-        self.render_widths = render_widths
+        self.poll_interval = poll_interval
         self.bos_id = tokenizer.token_to_id("<s>")
         self.eos_id = tokenizer.token_to_id("</s>")
         self.pad_id = tokenizer.token_to_id("<pad>")
-        self.diagram_types = list(DIAGRAM_BUILDERS.keys())
+        self.max_queue_samples = queue_depth_batches * batch_size
 
-    def _make_rng(self) -> random.Random:
-        # Distinct-but-deterministic seed per DataLoader worker: keeps a run
-        # reproducible for a given --seed (useful for debugging a specific
-        # step) while making sure num_workers>1 doesn't have every worker
-        # emit the exact same stream in lockstep.
-        worker_info = get_worker_info()
-        worker_id = worker_info.id if worker_info is not None else 0
-        return random.Random(self.seed * 1_000_003 + worker_id)
+        # Fresh start: don't let leftover files from a previous (e.g.
+        # crashed) run get silently consumed as if they were live data.
+        if spool_dir.exists():
+            shutil.rmtree(spool_dir)
+        spool_dir.mkdir(parents=True, exist_ok=True)
 
-    def __iter__(self):
-        rng = self._make_rng()
-        while True:
-            diagram_type = rng.choice(self.diagram_types)
-            src = DIAGRAM_BUILDERS[diagram_type](rng)
-            theme, look = random_theme_and_look(rng)
-            wrapped = wrap_with_frontmatter(src, theme, look)
-            width = rng.choice(self.render_widths)
+        self._stop_event = mp.Event()
+        self._procs = [
+            mp.Process(
+                target=_spool_producer_loop,
+                args=(spool_dir, seed, i, self.max_queue_samples,
+                      render_widths, poll_interval, self._stop_event),
+                daemon=True,
+            )
+            for i in range(num_workers)
+        ]
+        for p in self._procs:
+            p.start()
 
-            try:
-                diagram = mermaidx.render(wrapped)
-                png_bytes = diagram.png(width=width, background="#ffffff")
-            except Exception:
-                # A bad random sample (e.g. a generator edge case mermaidx's
-                # engine rejects) shouldn't kill the whole training run --
-                # same "skip and keep going" policy generate_dataset.py uses.
-                continue
-            if png_bytes is None:
-                continue
+    def qsize(self) -> int:
+        """Current queue depth in samples -- what an independent inspector
+        (or this process's own logging) sees by listing spool_dir."""
+        return sum(1 for _ in self.spool_dir.glob("*.png"))
 
-            img = Image.open(io.BytesIO(png_bytes))
-            img_tensor = self.transform(img)
+    def get_batch(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        images: list[torch.Tensor] = []
+        id_lists: list[torch.Tensor] = []
+        while len(images) < batch_size:
+            for png_path in sorted(self.spool_dir.glob("*.png")):
+                if len(images) >= batch_size:
+                    break
+                json_path = png_path.with_suffix(".json")
+                try:
+                    with open(json_path) as f:
+                        meta = json.load(f)
+                    img = Image.open(png_path)
+                    img.load()  # force full read into memory before we delete the file
+                except (FileNotFoundError, OSError, json.JSONDecodeError):
+                    # extremely unlikely (only this process deletes), but a
+                    # torn read shouldn't crash training -- just skip it
+                    continue
+                finally:
+                    png_path.unlink(missing_ok=True)
+                    json_path.unlink(missing_ok=True)
 
-            ids = self.tokenizer.encode(src).ids
-            ids = [self.bos_id] + ids[: self.max_len - 2] + [self.eos_id]
-            yield img_tensor, torch.tensor(ids, dtype=torch.long)
+                img_tensor = self.transform(img.convert("RGB"))
+                ids = self.tokenizer.encode(meta["target"]).ids
+                ids = [self.bos_id] + ids[: self.max_len - 2] + [self.eos_id]
+                images.append(img_tensor)
+                id_lists.append(torch.tensor(ids, dtype=torch.long))
+
+            if len(images) < batch_size:
+                time.sleep(self.poll_interval)
+
+        max_len = max(len(ids) for ids in id_lists)
+        padded = torch.full((len(id_lists), max_len), self.pad_id, dtype=torch.long)
+        for i, ids in enumerate(id_lists):
+            padded[i, : len(ids)] = ids
+        return torch.stack(images), padded
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        for p in self._procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+        shutil.rmtree(self.spool_dir, ignore_errors=True)
 
 
 class PadCollate:
@@ -343,22 +471,28 @@ def main():
                           "already exist via `make data`) -- for direct before/after comparison")
     ap.add_argument("--steps-per-epoch", type=int, default=300,
                      help="only used with --on-the-fly, which has no natural epoch boundary "
-                          "(the generator is infinite by design). 300 steps * batch-size 16 = "
+                          "(production is infinite by design). 300 steps * batch-size 16 = "
                           "4800 fresh samples/epoch as a starting point -- raise if train_loss "
                           "looks noisy/unstable, lower if each epoch takes too long.")
     ap.add_argument("--num-workers", type=int, default=4,
-                     help="DataLoader workers. With --on-the-fly this matters more than usual: "
-                          "rendering happens IN the data-loading path now (CPU-bound). Measured "
-                          "in-sandbox (single process, CPU): ~9s one-time mermaidx/QuickJS engine "
-                          "warmup per process, then ~0.1-0.95s/render steady-state (~0.3s avg) "
-                          "depending on diagram type/complexity. Each worker pays the ~9s warmup "
-                          "once, not per sample -- more workers buys roughly linear steady-state "
-                          "throughput after that. Size this against your GPU's forward+backward "
-                          "time per batch: if data generation is slower, the GPU sits idle waiting "
-                          "on it, and more workers (or fewer steps-per-epoch) is the fix.")
+                     help="number of producer OS processes rendering diagrams in parallel for "
+                          "--on-the-fly (see SpoolQueue). Measured in-sandbox (single process, "
+                          "CPU): ~9s one-time mermaidx/QuickJS engine warmup per process, then "
+                          "~0.1-0.95s/render steady-state (~0.3s avg) depending on diagram type. "
+                          "Each worker pays the ~9s warmup once, not per sample. Size this against "
+                          "your GPU's forward+backward time per batch: if production is slower, "
+                          "the trainer blocks in get_batch() waiting on the queue -- watch the "
+                          "'queue depth' logged each epoch and add workers if it's often near 0."
+                          "With --no-on-the-fly this is instead passed straight through as "
+                          "DataLoader(num_workers=...) for the fixed-manifest path.")
+    ap.add_argument("--queue-depth-batches", type=int, default=10,
+                     help="only used with --on-the-fly. Producers stop rendering once the spool "
+                          "queue holds this many batches' worth of samples, so a slow GPU step "
+                          "can't make disk usage grow without bound. Also caps how much can ever "
+                          "be 'in flight' for inspect_on_the_fly.py to look at.")
     ap.add_argument("--seed", type=int, default=0,
                      help="seeds the on-the-fly generator (per-worker-derived, see "
-                          "OnTheFlyReconstructorDataset._make_rng) for reproducible debugging")
+                          "_spool_producer_loop) for reproducible debugging")
     ap.add_argument("--results-dir", type=str, default="./results/reconstructor")
     args = ap.parse_args()
 
@@ -385,20 +519,33 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                              collate_fn=collate, num_workers=2)
 
+    train_queue = None  # SpoolQueue, only used when args.on_the_fly
     if args.on_the_fly:
-        print(f"train data: on-the-fly generation via mermaidx "
-              f"({args.steps_per_epoch} steps/epoch, batch size {args.batch_size})")
-        train_ds = OnTheFlyReconstructorDataset(tokenizer, transform=train_tf, seed=args.seed)
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                   collate_fn=collate, num_workers=args.num_workers)
-        train_iter = iter(train_loader)  # kept alive across epochs -- see class docstring
+        spool_dir = results_dir / "otf_queue"
+        print(f"train data: on-the-fly generation via {args.num_workers} producer processes, "
+              f"disk-spool queue at {spool_dir} (depth cap {args.queue_depth_batches} batches, "
+              f"{args.steps_per_epoch} steps/epoch, batch size {args.batch_size})")
+        print(f"  -> while training runs, inspect the live queue with: "
+              f"python inspect_on_the_fly.py --debug-dir {spool_dir}")
+        print(f"  -> queue depth will read 0 for the first ~10-15s: each of the "
+              f"{args.num_workers} producer processes pays a one-time mermaidx/QuickJS "
+              f"engine warmup before its first render (measured ~9s on an otherwise-idle "
+              f"CPU core in testing -- longer if workers > CPU cores, since they then "
+              f"compete for the same core during that CPU-bound warmup). This is normal, "
+              f"not a hang.")
+        train_queue = SpoolQueue(
+            spool_dir, tokenizer, train_tf,
+            num_workers=args.num_workers,
+            queue_depth_batches=args.queue_depth_batches,
+            batch_size=args.batch_size,
+            seed=args.seed,
+        )
         steps_per_epoch = args.steps_per_epoch
     else:
         train_ds = ReconstructorDataset(root, "train", tokenizer, transform=train_tf)
         print(f"train data: fixed manifest, {len(train_ds)} samples")
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                    collate_fn=collate, num_workers=2)
-        train_iter = None
         steps_per_epoch = len(train_loader)
     print(f"val samples: {len(val_ds)}")
 
@@ -417,46 +564,55 @@ def main():
 
     history = []
     best_val_loss = float("inf")
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        running_loss = 0.0
-        if args.on_the_fly:
-            for _ in range(steps_per_epoch):
-                images, ids = next(train_iter)
-                images, ids = images.to(device), ids.to(device)
-                decoder_input, labels = ids[:, :-1], ids[:, 1:]
+    try:
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            running_loss = 0.0
+            if args.on_the_fly:
+                for _ in range(steps_per_epoch):
+                    images, ids = train_queue.get_batch(args.batch_size)
+                    images, ids = images.to(device), ids.to(device)
+                    decoder_input, labels = ids[:, :-1], ids[:, 1:]
 
-                optimizer.zero_grad()
-                logits = model(images, decoder_input)
-                loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item()
-        else:
-            for images, ids in train_loader:
-                images, ids = images.to(device), ids.to(device)
-                decoder_input, labels = ids[:, :-1], ids[:, 1:]
+                    optimizer.zero_grad()
+                    logits = model(images, decoder_input)
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+                    loss.backward()
+                    optimizer.step()
+                    running_loss += loss.item()
+            else:
+                for images, ids in train_loader:
+                    images, ids = images.to(device), ids.to(device)
+                    decoder_input, labels = ids[:, :-1], ids[:, 1:]
 
-                optimizer.zero_grad()
-                logits = model(images, decoder_input)
-                loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item()
+                    optimizer.zero_grad()
+                    logits = model(images, decoder_input)
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+                    loss.backward()
+                    optimizer.step()
+                    running_loss += loss.item()
 
-        train_loss = running_loss / steps_per_epoch
-        val_loss, val_token_acc = evaluate(model, val_loader, device, pad_id, criterion)
-        print(f"epoch {epoch:3d}/{args.epochs}  train_loss={train_loss:.4f}  "
-              f"val_loss={val_loss:.4f}  val_token_acc={val_token_acc:.4f}")
-        history.append({
-            "epoch": epoch, "train_loss": train_loss,
-            "val_loss": val_loss, "val_token_acc": val_token_acc,
-        })
+            train_loss = running_loss / steps_per_epoch
+            val_loss, val_token_acc = evaluate(model, val_loader, device, pad_id, criterion)
+            queue_note = f"  queue_depth={train_queue.qsize()}" if args.on_the_fly else ""
+            print(f"epoch {epoch:3d}/{args.epochs}  train_loss={train_loss:.4f}  "
+                  f"val_loss={val_loss:.4f}  val_token_acc={val_token_acc:.4f}{queue_note}")
+            history.append({
+                "epoch": epoch, "train_loss": train_loss,
+                "val_loss": val_loss, "val_token_acc": val_token_acc,
+            })
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save({"model_state": model.state_dict(), "vocab_size": vocab_size, "pad_id": pad_id},
-                       results_dir / "reconstructor_model.pt")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save({"model_state": model.state_dict(), "vocab_size": vocab_size, "pad_id": pad_id},
+                           results_dir / "reconstructor_model.pt")
+    finally:
+        # Always stop the producer processes and clean up the spool
+        # directory, even on Ctrl-C or an exception mid-epoch -- otherwise
+        # mermaidx-rendering worker processes are left running in the
+        # background after the script exits.
+        if train_queue is not None:
+            train_queue.shutdown()
 
     with open(results_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)

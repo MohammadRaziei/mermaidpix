@@ -160,11 +160,11 @@ overfitting to the default theme's look.
   type's parser with a lexical error -- confirmed by isolating it down to
   the exact triggering value, fixed by keeping generated coordinates at
   least 0.02 away from both 0 and 1.
-- ⚠️ **Not tested**: `model.py`, `train_router.py`, `train_reconstructor.py`,
-  `infer.py`. No GPU, no disk space for a `torch` install, and no network
-  access to download the ~330MB `microsoft/trocr-base-stage1` checkpoint in
-  my sandbox (hit "no space left on device" earlier in this project, before
-  the encoder swap to TrOCR). The code uses standard, stable APIs
+- ⚠️ **Not tested**: `model.py`, `train_router.py`, `infer.py`, and the
+  torch-dependent parts of `train_reconstructor.py` (the actual training
+  loop / tensor pipeline). No GPU, no disk space for a `torch` install, and
+  no network access to download the ~330MB `microsoft/trocr-base-stage1`
+  checkpoint in my sandbox. The code uses standard, stable APIs
   (`transformers.VisionEncoderDecoderModel`, `torchvision.models`,
   `nn.TransformerDecoder`) and I'm confident in the logic, but I have not
   watched it actually train. Run `python model.py` first (random weights,
@@ -172,20 +172,49 @@ overfitting to the default theme's look.
   together, then `python model.py --download` once you have network access
   to also confirm the real TrOCR checkpoint loads, before committing to a
   long training run.
+- ✅ **Tested (torch-independent parts only)**: the on-the-fly data
+  pipeline in `train_reconstructor.py` -- `SpoolQueue` /
+  `_spool_producer_loop`, i.e. everything up to but not including the
+  torchvision `transform` call. Verified with real multiprocessing in my
+  sandbox: 3 producer processes filling a 20-sample spool queue up to its
+  backpressure cap, a consumer reading + deleting every file (all valid
+  PNGs with matching JSON metadata, zero corrupt reads), and a clean
+  shutdown with no leftover processes or files. Also caught and fixed a
+  real bug this way: with `mermaidx` imported at *module* top-level, three
+  concurrent producer processes appeared to hang producing nothing for
+  30+ seconds -- turned out to be single-core CPU contention on 3
+  processes' simultaneous ~9s QuickJS warmup (the sandbox has exactly 1
+  vCPU), not a bug, but the `import mermaidx` was moved to be local to the
+  producer function anyway as a safer default. `inspect_on_the_fly.py`
+  (see below) was tested the same way, reading a live queue while
+  producers were actively writing to it.
 
 ## Run these in order
 
 ```bash
 make install       # pure pip install, no Node/npm/Chromium needed
 make smoke-test     # confirms mermaidx renders correctly (quick sanity check)
-make data           # generates data/router/ and data/reconstructor/
+make data           # generates data/router/, reconstructor VAL images, tokenizer corpus
 make tokenizer      # trains the ~6000-token BPE vocabulary on the generated corpus
 make train-router   # diagram-type classifier
-make train-reconstructor  # the image -> mermaid model
+make train-reconstructor  # the image -> mermaid model (on-the-fly train data, default)
 make package        # zips results/ into results.zip
 
 # or just:
 make all
+```
+
+Reconstructor **train** data is generated on-the-fly during training (see
+"On-the-fly training data" below) -- `make data` only renders its fixed
+**val** set plus a larger text-only corpus for the tokenizer, so there's no
+separate "render N training images to disk" step anymore. To compare
+against the old fixed-image approach directly: `make data-fixed && make
+train-reconstructor-fixed`.
+
+While `make train-reconstructor` is running, you can watch what's actually
+queued for training in a separate terminal:
+```bash
+python inspect_on_the_fly.py --debug-dir ./results/reconstructor/otf_queue --watch
 ```
 
 Then send me `results.zip`. Each training script also prints an explicit
@@ -197,17 +226,43 @@ If bandwidth is a concern, `make package` runs `python package_results.py`
 which supports `--no-checkpoints` to exclude the (small, but non-zero)
 `.pt` files and keep only logs/metrics/samples.
 
+## On-the-fly training data
+
+`train_reconstructor.py` defaults to generating its training data live
+instead of reading pre-rendered images off disk (`--no-on-the-fly` reverts
+to the old fixed-manifest behavior, for comparison). This matters because
+the model's original hallucinated-label problem came from training on a
+*finite* set of pre-rendered images -- no matter how large the label
+vocabulary, a fixed set of images is something a model can partially
+memorize instead of actually reading. On-the-fly generation makes that
+shortcut unavailable: no two training samples are ever the same image
+twice. The **val** split stays fixed (needed for val_loss to be comparable
+across epochs/runs).
+
+It's implemented as a disk-backed producer/consumer queue
+(`SpoolQueue`/`_spool_producer_loop` in `train_reconstructor.py`), not a
+plain `DataLoader(num_workers=N)`: `--num-workers` producer OS processes
+each independently render random diagrams via `mermaidx` and write them as
+`(png, json)` file pairs into `results/reconstructor/otf_queue/`; the
+trainer reads and immediately deletes each pair the moment it consumes it.
+That directory's current contents ARE the live queue, which is what makes
+`inspect_on_the_fly.py` possible as a completely separate, read-only
+process -- it just lists/opens files, with zero coupling to the trainer.
+`--queue-depth-batches` (default 10) caps how many batches' worth of
+samples producers are allowed to get ahead by.
+
 ## Files
 
 | File | Purpose |
 |---|---|
 | `IDEA.md` | design doc for the TrOCR-encoder architecture: rationale, diagram, size analysis, frozen/trainable layers |
 | `common/diagram_generators.py` | random, validated Mermaid source generators for all 29 types + negatives + theme/look randomization |
-| `generate_dataset.py` | renders training images via `mermaidx` (Step 1) |
+| `generate_dataset.py` | renders the router dataset + reconstructor VAL images + tokenizer text corpus (Step 1) |
 | `train_tokenizer.py` | trains the small BPE vocabulary (Step 2) |
 | `model.py` | the TrOCR-encoder + small-decoder architecture; `python model.py` prints param counts (add `--download` to also verify the real checkpoint loads) |
 | `train_router.py` | trains the diagram-type classifier (Step 3) |
-| `train_reconstructor.py` | trains the image->code model (Step 4) |
+| `train_reconstructor.py` | trains the image->code model (Step 4) -- on-the-fly training data by default, see above |
+| `inspect_on_the_fly.py` | separate, read-only tool to watch the live on-the-fly training queue while training runs |
 | `infer.py` | run the finished pipeline on a real image (Step 5, after training) |
 | `package_results.py` | zips `results/` for you to send back |
 | `Makefile` | orchestrates all of the above in order |
