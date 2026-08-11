@@ -1,5 +1,5 @@
 # Data generation (works on any machine, no GPU, no Node/npm/Chromium needed)
-mermaidx>=0.9.4
+mermaidx[all]>=0.9.4
 Pillow>=10.0
 numpy>=1.24
 matplotlib>=3.8
@@ -12,7 +12,15 @@ torch>=2.2
 torchvision>=0.17
 transformers>=4.40
 
+# Optional -- only needed if train_reconstructor.py's --render-engines
+# includes "merman" or "mermaid-rs-renderer" (independent Rust
+# reimplementations of Mermaid rendering, used for extra visual diversity
+# in on-the-fly training data -- see IDEA.md and train_reconstructor.py's
+# _spool_producer_loop). Not required for --render-engines quickjs (the
+# default) or for anything else in this pipeline.
+mmdr
+
 # Optional -- only needed for ocr_refine.py (experimental label-correction
 # post-process, see IDEA.md "Fallback plan"). Not required for the core
 # generate/tokenize/train/infer pipeline.
-# pyturboocr
+pyturboocr
