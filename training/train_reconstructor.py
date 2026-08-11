@@ -96,12 +96,16 @@ IMAGE_MEAN = _processor.image_mean
 IMAGE_STD = _processor.image_std
 
 
-def pad_to_square(img: Image.Image, fill=255) -> Image.Image:
+def pad_to_square(img: Image.Image, fill=255, centering: tuple[float, float] = (0.5, 0.5)) -> Image.Image:
     """Pad (don't stretch) to square before resizing, so text aspect ratio
-    -- important for OCR-like reading -- isn't distorted."""
+    -- important for OCR-like reading -- isn't distorted. `centering`
+    controls where the original image sits within the padded square:
+    (0.5, 0.5) is centered (mermaidx's own renders always come out
+    perfectly centered in a tight bounding box -- see build_transform's
+    train-time override for why that's worth varying)."""
     w, h = img.size
     side = max(w, h)
-    return ImageOps.pad(img, (side, side), color=(fill, fill, fill), centering=(0.5, 0.5))
+    return ImageOps.pad(img, (side, side), color=(fill, fill, fill), centering=centering)
 
 
 def add_gaussian_noise(tensor: torch.Tensor, std: float) -> torch.Tensor:
@@ -114,12 +118,71 @@ def add_gaussian_noise(tensor: torch.Tensor, std: float) -> torch.Tensor:
     return (tensor + torch.randn_like(tensor) * std).clamp(0.0, 1.0)
 
 
+# The three transform "ops" below are plain classes with __call__, not
+# closures/lambdas, on purpose: DataLoader(num_workers>0) has to pickle the
+# whole Dataset (transform included) to hand it to worker processes. On
+# Linux this often goes unnoticed because the default 'fork' start method
+# doesn't need pickling at all -- but Windows (and macOS with 'spawn') always
+# does, and local lambdas/closures aren't picklable, which surfaces as
+# "Can't pickle local object 'build_transform.<locals>.<lambda>'" the moment
+# --no-on-the-fly's train_loader or (either mode's) val_loader tries to start
+# its num_workers>0 worker processes. A class defined at module level with no
+# unpicklable state (just plain floats/tuples in __init__) pickles fine
+# everywhere. Confirmed as the actual cause of this failure on a real Windows
+# run in conversation.
+class _EvalPad:
+    """Eval-time padding: fixed, centered -- the deterministic pipeline
+    that must be identical every time (see build_transform)."""
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        return pad_to_square(img.convert("RGB"))
+
+
+class _RandomAsymmetricPad:
+    """Train-time padding with randomized (asymmetric) centering -- see
+    build_transform's comment on why this augmentation exists."""
+
+    def __init__(self, low: float = 0.15, high: float = 0.85):
+        self.low = low
+        self.high = high
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        return pad_to_square(
+            img.convert("RGB"),
+            centering=(random.uniform(self.low, self.high), random.uniform(self.low, self.high)),
+        )
+
+
+class _AddGaussianNoise:
+    """Train-time tensor noise -- see add_gaussian_noise's docstring."""
+
+    def __init__(self, std: float):
+        self.std = std
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        return add_gaussian_noise(tensor, self.std)
+
+
 def build_transform(train: bool, augment_strength: float = 1.0) -> transforms.Compose:
     """augment_strength scales every augmentation op linearly; 0 disables
     augmentation entirely (equivalent to the old, pre-augmentation
     IMG_TRANSFORM) while keeping the eval-time pipeline (train=False)
     identical either way, since val/test should never be augmented."""
-    ops = [transforms.Lambda(lambda img: pad_to_square(img.convert("RGB")))]
+    if train and augment_strength > 0:
+        # Asymmetric padding: mermaidx always renders its diagram tightly
+        # and perfectly centered in the frame (pad_to_square's default
+        # centering=(0.5, 0.5)). Every real-world screenshot or photo this
+        # model might see at actual inference time won't be that clean --
+        # uneven margins, the diagram pushed toward one edge, etc. Without
+        # this, the model could learn to *rely on* perfect centering as a
+        # signal (e.g. "the content always starts at the same relative
+        # position") in a way that doesn't hold outside of mermaidx's own
+        # output. Range kept away from the 0/1 extremes so the diagram is
+        # never at risk of being clipped by the padding box.
+        pad_op = _RandomAsymmetricPad()
+    else:
+        pad_op = _EvalPad()
+    ops = [pad_op]
 
     if train and augment_strength > 0:
         ops += [
@@ -148,7 +211,7 @@ def build_transform(train: bool, augment_strength: float = 1.0) -> transforms.Co
     ]
 
     if train and augment_strength > 0:
-        ops.append(transforms.Lambda(lambda t: add_gaussian_noise(t, std=0.02 * augment_strength)))
+        ops.append(_AddGaussianNoise(std=0.02 * augment_strength))
 
     ops.append(transforms.Normalize(IMAGE_MEAN, IMAGE_STD))
     return transforms.Compose(ops)
@@ -210,6 +273,7 @@ def _spool_producer_loop(
     render_widths: tuple[int, ...],
     poll_interval: float,
     stop_event,
+    render_engines: tuple[str, ...] = ("quickjs",),
 ) -> None:
     """Runs in its own OS process (spawned by SpoolQueue.start). Endlessly
     renders fresh random diagrams and writes each as a (png, json) file
@@ -222,6 +286,28 @@ def _spool_producer_loop(
     Backpressure: if the directory already holds >= max_queue_samples
     pending pairs, this just polls and waits instead of rendering more, so
     a slow GPU step can't make disk usage grow without bound.
+
+    render_engines: which backend(s) to render each sample with, chosen
+    uniformly at random per sample. "quickjs" is mermaidx's own default
+    engine; "merman" and "mermaid-rs-renderer" (via the optional `mmdr`
+    package -- both independent Rust reimplementations, no JS/mermaid.js
+    involved) add real visual diversity for free, since they're still
+    100% labeled (same source text fed to every engine). Verified in
+    conversation: merman renders near-pixel-identical to mermaidx's own
+    QuickJS output (same colors/layout), while mermaid-rs-renderer differs
+    meaningfully -- different color scheme, different arrow style, and its
+    own layout choices can even mirror which side a branch appears on
+    (e.g. a Yes/No decision's left/right placement can flip relative to
+    quickjs/merman for the identical input text). That's fine, not a
+    labeling bug: the target text is renderer-agnostic by construction
+    (same source text regardless of which engine drew it), so this is
+    exactly the kind of visual-style diversity augmentation is supposed to
+    provide, the same way theme/color-jitter already does -- the engine
+    used is recorded in each sample's metadata for later analysis, but is
+    deliberately NOT fed to the model as an input (see IDEA.md: unlike
+    diagram_type, "which renderer produced this pixel image" isn't a
+    property a real-world image would ever have, so conditioning on it
+    wouldn't generalize past this synthetic dataset).
     """
     # Imported HERE, not at module top-level: this must be the first thing
     # that touches mermaidx in this process. Tested in conversation --
@@ -233,6 +319,18 @@ def _spool_producer_loop(
     # safer default regardless of what other libraries end up sharing this
     # process in the future.
     import mermaidx
+
+    non_quickjs_engines = [e for e in render_engines if e != "quickjs"]
+    mmdr = None
+    if non_quickjs_engines:
+        try:
+            import mmdr as _mmdr
+            mmdr = _mmdr
+        except ImportError:
+            print(f"[w{worker_id}] WARNING: --render-engines requested {non_quickjs_engines} "
+                  f"but the optional `mmdr` package isn't installed (pip install mmdr) -- "
+                  f"falling back to quickjs only for this worker.", flush=True)
+            render_engines = ("quickjs",)
 
     rng = random.Random(seed * 1_000_003 + worker_id)
     diagram_types = list(DIAGRAM_BUILDERS.keys())
@@ -248,9 +346,13 @@ def _spool_producer_loop(
         theme, look = random_theme_and_look(rng)
         wrapped = wrap_with_frontmatter(src, theme, look)
         width = rng.choice(render_widths)
+        engine = rng.choice(render_engines)
 
         try:
-            diagram = mermaidx.render(wrapped)
+            if engine == "quickjs":
+                diagram = mermaidx.render(wrapped)
+            else:
+                diagram = mmdr.render(wrapped, backend=engine)
             png_bytes = diagram.png(width=width, background="#ffffff")
         except Exception:
             # A bad random sample shouldn't kill the producer -- same
@@ -264,6 +366,7 @@ def _spool_producer_loop(
         meta = {
             "diagram_type": diagram_type, "theme": theme, "look": look,
             "width": width, "target": src, "worker_id": worker_id,
+            "engine": engine,  # provenance/debugging only -- never fed to the model, see docstring
             "written_at": time.time(),
         }
         try:
@@ -293,6 +396,7 @@ class SpoolQueue:
         max_len: int = 640,
         poll_interval: float = 0.05,
         render_widths: tuple[int, ...] = (600, 800, 1000),
+        render_engines: tuple[str, ...] = ("quickjs",),
     ):
         self.spool_dir = spool_dir
         self.tokenizer = tokenizer
@@ -315,7 +419,7 @@ class SpoolQueue:
             mp.Process(
                 target=_spool_producer_loop,
                 args=(spool_dir, seed, i, self.max_queue_samples,
-                      render_widths, poll_interval, self._stop_event),
+                      render_widths, poll_interval, self._stop_event, render_engines),
                 daemon=True,
             )
             for i in range(num_workers)
@@ -490,6 +594,19 @@ def main():
                           "queue holds this many batches' worth of samples, so a slow GPU step "
                           "can't make disk usage grow without bound. Also caps how much can ever "
                           "be 'in flight' for inspect_on_the_fly.py to look at.")
+    ap.add_argument("--render-engines", nargs="+", default=["quickjs"],
+                     choices=["quickjs", "merman", "mermaid-rs-renderer"],
+                     help="only used with --on-the-fly. Each sample is rendered with one engine "
+                          "chosen uniformly at random from this list -- 'quickjs' is mermaidx's "
+                          "own default; 'merman' and 'mermaid-rs-renderer' (independent Rust "
+                          "reimplementations, via the optional `mmdr` package -- pip install mmdr) "
+                          "add real visual diversity for free, since the target text stays "
+                          "renderer-agnostic. Verified in conversation: merman renders near-"
+                          "identical to quickjs, mermaid-rs-renderer differs meaningfully "
+                          "(different colors/arrow style, and can even mirror left/right branch "
+                          "placement) -- see the docstring on _spool_producer_loop. Default is "
+                          "quickjs-only so `mmdr` stays an optional dependency; try e.g. "
+                          "--render-engines quickjs merman mermaid-rs-renderer for the full mix.")
     ap.add_argument("--seed", type=int, default=0,
                      help="seeds the on-the-fly generator (per-worker-derived, see "
                           "_spool_producer_loop) for reproducible debugging")
@@ -539,6 +656,7 @@ def main():
             queue_depth_batches=args.queue_depth_batches,
             batch_size=args.batch_size,
             seed=args.seed,
+            render_engines=tuple(args.render_engines),
         )
         steps_per_epoch = args.steps_per_epoch
     else:
