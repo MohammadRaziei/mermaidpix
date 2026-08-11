@@ -683,6 +683,22 @@ of rendering alone. This should run as an occasional fine-tuning phase
 cross-entropy pretrain, then RL fine-tune), not interleaved into every
 batch of the main training loop.
 
+**Refinement raised in conversation: align before comparing pixels.**
+Even for a text-correct sample, the sampled render and the ground-truth
+render could differ in incidental framing -- canvas padding, exact
+bounding-box margins -- that have nothing to do with content correctness.
+A raw, unaligned pixel/SSIM diff would incorrectly penalize that. Fix:
+register the two images before comparing -- e.g. crop both to their
+content bounding box first (trivial for these renders: white background,
+so the bbox is just the non-white pixel extent), or align via a small
+translation search (phase correlation / template matching) before
+computing the reward. This is a separate, complementary fix from the
+multi-component-reward point above (RLRF's semantic-similarity term
+guards against *legitimate* layout cascades from a genuinely different
+label; alignment guards against *spurious* framing differences that
+aren't about content at all) -- both should probably be in the final
+reward function.
+
 **Open questions for whoever picks this up:** how many samples per example
 is actually enough to keep variance manageable here; whether SSIM
 meaningfully outperforms plain binary-render-success given the extra
@@ -751,7 +767,51 @@ mix in the router's actual prediction some fraction of training steps, or
 add label noise to the ground-truth conditioning signal, to be decided).
 Not implemented, no code written yet.
 
-## Future work: evaluate on FlowVQA as an out-of-distribution check
+## Multi-engine rendering for on-the-fly training diversity (implemented)
+
+Raised in conversation: `mermaidx` isn't the only renderer available --
+the optional `mmdr` package (confirmed installable, `pip install mmdr`,
+version 0.3.0 at the time of writing) provides two more backends, `merman`
+and `mermaid-rs-renderer`, both independent Rust reimplementations with no
+JavaScript/mermaid.js involved at all.
+
+**Tested by actually rendering the same diagram with all three and
+comparing the output** (not just reading the `mmdr` docs): `merman` comes
+out near-pixel-identical to mermaidx's own QuickJS backend -- same purple
+color scheme, same layout, same font. `mermaid-rs-renderer` is
+meaningfully different -- a blue-gray color scheme instead of purple, a
+different arrow style, and its own layout choices can even flip which
+side a branch appears on (a `Yes`/`No` decision's left/right placement
+differed between quickjs/merman and mermaid-rs-renderer for the identical
+input diagram). That's not a labeling bug -- the *target text* passed to
+training is always the same regardless of which engine rendered it, so
+this is exactly the kind of free, still-perfectly-labeled visual-style
+diversity that on-the-fly generation was already providing via
+theme/color-jitter, just from a structurally different source.
+
+**Implemented in `_spool_producer_loop`** (`train_reconstructor.py`): each
+sample is rendered with one engine chosen uniformly at random from
+`--render-engines` (default: `("quickjs",)`, i.e. unchanged behavior --
+`mmdr` stays an optional dependency). The engine used is recorded in each
+sample's spool metadata (`meta["engine"]`) for later debugging/analysis,
+but is deliberately **not** fed into the model as an input or conditioning
+signal -- see the "not added to router" decision below.
+
+**Decision: not added as a router or reconstructor conditioning signal.**
+Considered explicitly in conversation (a 3-way "which engine" classifier,
+analogous to the diagram_type-conditioning future-work idea above). Ruled
+out: unlike diagram_type, which is a real, meaningful property that even
+a genuine real-world image has, "which of these three specific synthetic
+renderers produced this image" is not a property any real-world image
+(a screenshot, a photo of a whiteboard, output from some other tool
+entirely) can meaningfully have -- there's no fourth "something else"
+bucket that would generalize past this project's own training data. A
+conditioning signal that can only ever be correct on synthetic data isn't
+useful at real inference time, unlike diagram_type conditioning which
+generalizes fine (a real image genuinely does have *some* diagram type).
+The model should simply become robust to which renderer produced an image
+through exposure to the diversity, the same way it's meant to become
+robust to theme/color variation already -- not be told the answer.
 
 **Idea, not yet implemented.** Every image this model has ever been
 trained *or* validated on -- on-the-fly (`SpoolQueue`) or fixed-manifest,
