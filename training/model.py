@@ -28,6 +28,8 @@ import torch
 import torch.nn as nn
 from transformers import VisionEncoderDecoderModel
 
+from hf_offline_first import from_pretrained_offline_first
+
 
 class MermaidReconstructor(nn.Module):
     def __init__(
@@ -49,7 +51,11 @@ class MermaidReconstructor(nn.Module):
 
         # --- Encoder: TrOCR's pretrained BEiT-Base, decoder half discarded ---
         if pretrained:
-            trocr = VisionEncoderDecoderModel.from_pretrained(trocr_checkpoint)
+            # offline-first: see hf_offline_first.py -- fixes a reported bug
+            # where a flaky connection mid-training kept surfacing "wants to
+            # reconnect to HuggingFace" even though the checkpoint was
+            # already fully cached from a previous run.
+            trocr = from_pretrained_offline_first(VisionEncoderDecoderModel, trocr_checkpoint)
             self.encoder = trocr.encoder
             del trocr.decoder  # we only wanted the encoder half
         else:

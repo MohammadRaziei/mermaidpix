@@ -19,10 +19,12 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import logging
 import multiprocessing as mp
 import os
 import random
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -33,6 +35,8 @@ from tokenizers import ByteLevelBPETokenizer
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from transformers import AutoImageProcessor
+
+from hf_offline_first import from_pretrained_offline_first
 
 from common.diagram_generators import (
     DIAGRAM_BUILDERS,
@@ -83,7 +87,7 @@ TROCR_CHECKPOINT = "microsoft/trocr-base-stage1"
 # Pulled from the actual TrOCR processor rather than hand-picking a resize/
 # normalization -- this must match what the pretrained encoder expects, or
 # the "pretrained" weights are being fed out-of-distribution inputs.
-_processor = AutoImageProcessor.from_pretrained(TROCR_CHECKPOINT)
+_processor = from_pretrained_offline_first(AutoImageProcessor, TROCR_CHECKPOINT)
 raw_size = _processor.size
 if hasattr(raw_size, "height"):
     IMG_SIZE = int(raw_size.height)
@@ -545,6 +549,38 @@ def qualitative_samples(model, dataset, tokenizer, device, n_per_type=2):
     return samples
 
 
+def setup_logging(results_dir: Path) -> logging.Logger:
+    """Logs to BOTH stdout (so tmux/a live terminal shows progress -- the
+    whole point being requested in conversation was "it looks frozen in
+    tmux") AND results/reconstructor/train.log (so the full log travels
+    inside results.zip -- package_results.py already zips everything under
+    results/ recursively, so this needs no changes there). Timestamps on
+    every line double as the timing info asked for: diffing two line
+    timestamps tells you the actual wall-clock rate directly from the log,
+    even without the explicit steps/sec numbers logged during training."""
+    logger = logging.getLogger("train_reconstructor")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()  # avoid duplicate lines if main() ever runs twice in one process
+    fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(fmt)
+    logger.addHandler(stream_handler)
+
+    file_handler = logging.FileHandler(results_dir / "train.log", mode="w", encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+def format_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default="./data/reconstructor",
@@ -611,18 +647,30 @@ def main():
                      help="seeds the on-the-fly generator (per-worker-derived, see "
                           "_spool_producer_loop) for reproducible debugging")
     ap.add_argument("--results-dir", type=str, default="./results/reconstructor")
+    ap.add_argument("--log-every", type=int, default=20,
+                     help="log a progress line every N training steps (in addition to the "
+                          "once-per-epoch summary line) -- exists specifically so a long epoch "
+                          "(e.g. --steps-per-epoch 300 with slow on-the-fly rendering) doesn't "
+                          "sit silent long enough to look frozen in a terminal/tmux session. Set "
+                          "higher for less noise, or very high to effectively disable.")
+    ap.add_argument("--qualitative-n-per-type", type=int, default=20,
+                     help="how many val samples per diagram type to include in "
+                          "qualitative_samples.json (was hardcoded to 2 -- too small a sample to "
+                          "tell a real per-type pattern from n=2 noise, see conversation's Round 2 "
+                          "analysis of results1.zip).")
     args = ap.parse_args()
 
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logging(results_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("device:", device)
+    logger.info(f"device: {device}")
 
     tokenizer = load_tokenizer(Path(args.tokenizer))
     pad_id = tokenizer.token_to_id("<pad>")
     vocab_size = tokenizer.get_vocab_size()
-    print(f"tokenizer vocab size: {vocab_size}")
+    logger.info(f"tokenizer vocab size: {vocab_size}")
 
     root = Path(args.data)
     train_tf = build_transform(train=True, augment_strength=args.augment_strength)
@@ -639,17 +687,17 @@ def main():
     train_queue = None  # SpoolQueue, only used when args.on_the_fly
     if args.on_the_fly:
         spool_dir = results_dir / "otf_queue"
-        print(f"train data: on-the-fly generation via {args.num_workers} producer processes, "
-              f"disk-spool queue at {spool_dir} (depth cap {args.queue_depth_batches} batches, "
-              f"{args.steps_per_epoch} steps/epoch, batch size {args.batch_size})")
-        print(f"  -> while training runs, inspect the live queue with: "
-              f"python inspect_on_the_fly.py --debug-dir {spool_dir}")
-        print(f"  -> queue depth will read 0 for the first ~10-15s: each of the "
-              f"{args.num_workers} producer processes pays a one-time mermaidx/QuickJS "
-              f"engine warmup before its first render (measured ~9s on an otherwise-idle "
-              f"CPU core in testing -- longer if workers > CPU cores, since they then "
-              f"compete for the same core during that CPU-bound warmup). This is normal, "
-              f"not a hang.")
+        logger.info(f"train data: on-the-fly generation via {args.num_workers} producer processes, "
+                    f"disk-spool queue at {spool_dir} (depth cap {args.queue_depth_batches} batches, "
+                    f"{args.steps_per_epoch} steps/epoch, batch size {args.batch_size})")
+        logger.info(f"  -> while training runs, inspect the live queue with: "
+                    f"python inspect_on_the_fly.py --debug-dir {spool_dir}")
+        logger.info(f"  -> queue depth will read 0 for the first ~10-15s: each of the "
+                    f"{args.num_workers} producer processes pays a one-time mermaidx/QuickJS "
+                    f"engine warmup before its first render (measured ~9s on an otherwise-idle "
+                    f"CPU core in testing -- longer if workers > CPU cores, since they then "
+                    f"compete for the same core during that CPU-bound warmup). This is normal, "
+                    f"not a hang.")
         train_queue = SpoolQueue(
             spool_dir, tokenizer, train_tf,
             num_workers=args.num_workers,
@@ -661,18 +709,18 @@ def main():
         steps_per_epoch = args.steps_per_epoch
     else:
         train_ds = ReconstructorDataset(root, "train", tokenizer, transform=train_tf)
-        print(f"train data: fixed manifest, {len(train_ds)} samples")
+        logger.info(f"train data: fixed manifest, {len(train_ds)} samples")
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                    collate_fn=collate, num_workers=2)
         steps_per_epoch = len(train_loader)
-    print(f"val samples: {len(val_ds)}")
+    logger.info(f"val samples: {len(val_ds)}")
 
     model = MermaidReconstructor(
         vocab_size=vocab_size, pad_id=pad_id, freeze_bottom_n_blocks=args.freeze_bottom_n_blocks,
     ).to(device)
     param_counts = model.num_params()
-    print("model size:", {k: f"{v/1e6:.2f}M" for k, v in param_counts.items()})
-    print(f"trainable share: {param_counts['total_trainable']/param_counts['total']*100:.1f}%")
+    logger.info(f"model size: {{{', '.join(f'{k}={v/1e6:.2f}M' for k, v in param_counts.items())}}}")
+    logger.info(f"trainable share: {param_counts['total_trainable']/param_counts['total']*100:.1f}%")
 
     optimizer = torch.optim.AdamW([
         {"params": model.encoder_param_groups(), "lr": args.encoder_lr},
@@ -682,12 +730,36 @@ def main():
 
     history = []
     best_val_loss = float("inf")
+    train_start_time = time.time()
     try:
         for epoch in range(1, args.epochs + 1):
             model.train()
             running_loss = 0.0
+            epoch_start = time.time()
+
+            def log_step_progress(step: int) -> None:
+                """Shared by both branches below -- every --log-every steps,
+                print elapsed/rate/ETA so a long, quiet epoch (on-the-fly
+                especially, where a step can genuinely take a second or more
+                once rendering is the bottleneck -- see SpoolQueue) doesn't
+                look indistinguishable from a hang in a terminal/tmux
+                session with nothing else on screen to prove otherwise."""
+                if step % args.log_every != 0 and step != steps_per_epoch:
+                    return
+                elapsed = time.time() - epoch_start
+                steps_per_sec = step / elapsed if elapsed > 0 else 0.0
+                samples_per_sec = steps_per_sec * args.batch_size
+                eta = (steps_per_epoch - step) / steps_per_sec if steps_per_sec > 0 else float("inf")
+                avg_loss = running_loss / step
+                queue_note = f"  queue_depth={train_queue.qsize()}" if args.on_the_fly else ""
+                logger.info(
+                    f"  epoch {epoch:3d}/{args.epochs}  step {step:4d}/{steps_per_epoch}  "
+                    f"loss={avg_loss:.4f}  {steps_per_sec:.2f} step/s  {samples_per_sec:.1f} "
+                    f"samples/s  elapsed={format_eta(elapsed)}  eta={format_eta(eta)}{queue_note}"
+                )
+
             if args.on_the_fly:
-                for _ in range(steps_per_epoch):
+                for step in range(1, steps_per_epoch + 1):
                     images, ids = train_queue.get_batch(args.batch_size)
                     images, ids = images.to(device), ids.to(device)
                     decoder_input, labels = ids[:, :-1], ids[:, 1:]
@@ -698,8 +770,9 @@ def main():
                     loss.backward()
                     optimizer.step()
                     running_loss += loss.item()
+                    log_step_progress(step)
             else:
-                for images, ids in train_loader:
+                for step, (images, ids) in enumerate(train_loader, start=1):
                     images, ids = images.to(device), ids.to(device)
                     decoder_input, labels = ids[:, :-1], ids[:, 1:]
 
@@ -709,21 +782,32 @@ def main():
                     loss.backward()
                     optimizer.step()
                     running_loss += loss.item()
+                    log_step_progress(step)
 
             train_loss = running_loss / steps_per_epoch
+            val_start = time.time()
             val_loss, val_token_acc = evaluate(model, val_loader, device, pad_id, criterion)
+            epoch_elapsed = time.time() - epoch_start
+            total_elapsed = time.time() - train_start_time
             queue_note = f"  queue_depth={train_queue.qsize()}" if args.on_the_fly else ""
-            print(f"epoch {epoch:3d}/{args.epochs}  train_loss={train_loss:.4f}  "
-                  f"val_loss={val_loss:.4f}  val_token_acc={val_token_acc:.4f}{queue_note}")
+            logger.info(
+                f"epoch {epoch:3d}/{args.epochs}  train_loss={train_loss:.4f}  "
+                f"val_loss={val_loss:.4f}  val_token_acc={val_token_acc:.4f}{queue_note}  "
+                f"epoch_time={format_eta(epoch_elapsed)} (val eval {format_eta(time.time() - val_start)})  "
+                f"total_elapsed={format_eta(total_elapsed)}  "
+                f"est_remaining={format_eta(epoch_elapsed * (args.epochs - epoch))}"
+            )
             history.append({
                 "epoch": epoch, "train_loss": train_loss,
                 "val_loss": val_loss, "val_token_acc": val_token_acc,
+                "epoch_seconds": round(epoch_elapsed, 1),
             })
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save({"model_state": model.state_dict(), "vocab_size": vocab_size, "pad_id": pad_id},
                            results_dir / "reconstructor_model.pt")
+                logger.info(f"  -> new best val_loss, checkpoint saved")
     finally:
         # Always stop the producer processes and clean up the spool
         # directory, even on Ctrl-C or an exception mid-epoch -- otherwise
@@ -735,8 +819,8 @@ def main():
     with open(results_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    print("\nGenerating qualitative samples on val set...")
-    samples = qualitative_samples(model, val_ds, tokenizer, device, n_per_type=2)
+    logger.info("\nGenerating qualitative samples on val set...")
+    samples = qualitative_samples(model, val_ds, tokenizer, device, n_per_type=args.qualitative_n_per_type)
     with open(results_dir / "qualitative_samples.json", "w") as f:
         json.dump(samples, f, indent=2)
     exact_match_rate = sum(s["exact_match"] for s in samples) / len(samples)
@@ -755,15 +839,18 @@ def main():
             "total, all distinct)" if args.on_the_fly else len(train_ds)
         ),
         "num_val_samples": len(val_ds),
+        "total_train_seconds": round(time.time() - train_start_time, 1),
     }
     with open(results_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"\nBest val loss: {best_val_loss:.4f}")
-    print(f"Final val token accuracy: {history[-1]['val_token_acc']:.4f}")
-    print(f"Qualitative exact-match rate ({len(samples)} samples, ~2 per diagram type): {exact_match_rate:.2f}")
-    print(f"Saved model + history + samples to {results_dir}/")
-    print(
+    logger.info(f"\nBest val loss: {best_val_loss:.4f}")
+    logger.info(f"Final val token accuracy: {history[-1]['val_token_acc']:.4f}")
+    logger.info(f"Qualitative exact-match rate ({len(samples)} samples, "
+                f"~{args.qualitative_n_per_type} per diagram type): {exact_match_rate:.2f}")
+    logger.info(f"Total training time: {format_eta(time.time() - train_start_time)}")
+    logger.info(f"Saved model + history + samples + train.log to {results_dir}/")
+    logger.info(
         "\n>>> Please paste back: the train/val loss curve, final val_token_acc, "
         "and a couple of the qualitative_samples.json entries (especially any "
         "exact_match=false ones) -- I'll look at *where* the prediction diverges "
@@ -774,3 +861,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
