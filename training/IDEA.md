@@ -443,7 +443,91 @@ needs to be. If it barely moves, that points toward a harder problem
 (e.g. label text is too small/low-resolution for the encoder to resolve
 individual characters reliably) that a bigger vocabulary alone won't fix.
 
-## Fallback plan if the vocabulary fix isn't enough: PP-OCRv6 (not TurboOCR itself)
+## Round 2: on-the-fly generation fixed overfitting, but NOT the label hallucination
+
+Analyzed `results1.zip` from `make train-reconstructor` running the
+on-the-fly pipeline (`SpoolQueue`, see NOTE 2/3 above) with the 87x-larger
+vocabulary from the previous finding. Summary:
+
+| Metric | Round 1 (fixed manifest, small vocab) | Round 2 (on-the-fly, 87x vocab) |
+|---|---|---|
+| train/val loss | val_loss **rises** past epoch ~10-12 (overfitting) | val_loss tracks train_loss closely through ~epoch 20, only a mild reappearance after epoch 23 (val flat ~0.57 while train keeps dropping to 0.541 by epoch 30) |
+| `val_token_acc` | plateaus ~0.84-0.85 | 0.770 -> 0.820, plateaus ~epoch 20-23 |
+| `qualitative_exact_match_rate` | 0/8 inspected (0%) | **0.190 (11/58)** overall |
+
+**The on-the-fly fix worked for what it targeted**: the severe
+train/val divergence from Round 1 is gone. This confirms the diagnosis
+from NOTE 2 -- a *finite* set of pre-rendered images was memorizable
+regardless of vocabulary size, and removing that finite set removed that
+specific failure mode.
+
+**But the underlying hallucination problem is still there, and Round 2's
+larger sample (58 vs. 8, spread across all 29 types instead of
+accidentally all-flowchart -- see Round 1's own bug note above) makes the
+pattern much clearer than Round 1 could:**
+
+| Diagram type family | exact_match rate (2 samples/type) |
+|---|---|
+| Small/templated vocabulary: `gitgraph`, `state_diagram`, `block`, `cynefin`, `wardley` | **100% (2/2 each)** |
+| Free-text-heavy: `flowchart`, `sequence`, `gantt`, `pie`, and most others | **0% (0/2 each)** |
+
+Structure (node count, shape types, edge topology, diagram-specific
+syntax) is correct in every inspected sample, free-text or not -- same as
+Round 1. The smoking-gun example, a `pie` chart:
+```
+ground truth: "status":33, "email":27, "order":92, "session":51, "database":18, "payment":62
+prediction:   "token":74, "token":74, "session":74, "session":74, "session":74
+```
+The model repeats the same (label, number) pair five times regardless of
+the five visually distinct slices in front of it -- not just "wrong
+guess," but a degenerate repetition loop, which points toward weak
+image-grounding in the decoder for this class of content (the decoder
+falling back on its own recent output / learned continuation statistics
+rather than attending to the specific region it should be reading next),
+not merely "vocabulary was too small" (Round 1's fix already addressed
+vocabulary size specifically, and this persists anyway).
+
+**Updated plan, in priority order (discussed and agreed on in
+conversation):**
+
+1. **Cheap re-diagnosis first, no retraining.** Round 2's per-type
+   breakdown is only 2 samples/type -- re-run with a larger
+   `qualitative_samples` count per type (e.g. 20) to confirm the
+   templated-vocab-vs-free-text split is a stable pattern, not noise from
+   n=2 buckets, before spending any GPU time on a fix.
+2. **Try `--freeze-bottom-n-blocks 0` or `2`** (currently 4). Hypothesis:
+   TrOCR's pretraining was on single cropped text lines; reading several
+   small, precisely-positioned labels scattered across a full-page
+   diagram image is a meaningfully different visual task, and the frozen
+   bottom blocks' generic features may not resolve small label text at
+   arbitrary page positions well enough. Cheapest real architecture
+   experiment available -- one flag, one re-run.
+3. **If (1)-(2) don't fix it: add a copy/pointer mechanism to the
+   decoder.** This is the architecturally-targeted fix for exactly this
+   failure mode (well-established in summarization/OCR literature for
+   forcing a decoder to reproduce exact spans from a source rather than
+   generate from a learned vocabulary distribution) -- instead of a free
+   vocabulary-head softmax at every step, let the decoder optionally copy
+   directly from encoder positions via its own cross-attention
+   distribution. Not implemented, not scoped in detail yet -- likely the
+   right next architecture change if 1-2 don't resolve this, since it
+   targets grounding directly rather than hoping more data/capacity fixes
+   it indirectly.
+4. **Deprioritize the render-based-RL-reward and diagram_type-
+   conditioning future-work ideas above until this is fixed.** Both
+   target problems (non-differentiable optimization of the *whole*
+   sequence; disambiguating *which* diagram type/syntax to use) that
+   aren't the bottleneck right now -- structure/syntax is already correct
+   in every inspected sample, hallucinated or not. Fixing those first
+   wouldn't move the actual metric that's failing.
+5. **Lowest priority: more epochs on the unchanged config.** The mild
+   post-epoch-23 val_loss/train_loss divergence (train still dropping,
+   val flat) suggests blindly extending training risks the model getting
+   *more confident* in its hallucinated guesses rather than more accurate,
+   without first addressing why it isn't grounding on the pixels for
+   free-text content.
+
+
 
 You pointed me at [TurboOCR](https://github.com/aiptimizer/TurboOCR) as a
 candidate fix for the label-hallucination problem above, then did real
