@@ -735,6 +735,8 @@ def main():
         for epoch in range(1, args.epochs + 1):
             model.train()
             running_loss = 0.0
+            running_correct_tokens = 0
+            running_total_tokens = 0
             epoch_start = time.time()
 
             def log_step_progress(step: int) -> None:
@@ -751,54 +753,65 @@ def main():
                 samples_per_sec = steps_per_sec * args.batch_size
                 eta = (steps_per_epoch - step) / steps_per_sec if steps_per_sec > 0 else float("inf")
                 avg_loss = running_loss / step
+                avg_acc = running_correct_tokens / max(running_total_tokens, 1)
                 queue_note = f"  queue_depth={train_queue.qsize()}" if args.on_the_fly else ""
                 logger.info(
                     f"  epoch {epoch:3d}/{args.epochs}  step {step:4d}/{steps_per_epoch}  "
-                    f"loss={avg_loss:.4f}  {steps_per_sec:.2f} step/s  {samples_per_sec:.1f} "
-                    f"samples/s  elapsed={format_eta(elapsed)}  eta={format_eta(eta)}{queue_note}"
+                    f"train_loss={avg_loss:.4f}  train_acc={avg_acc:.4f}  {steps_per_sec:.2f} step/s  "
+                    f"{samples_per_sec:.1f} samples/s  elapsed={format_eta(elapsed)}  "
+                    f"eta={format_eta(eta)}{queue_note}"
                 )
+
+            def train_step(images: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+                """Shared by both branches -- one optimizer step, and (new)
+                tracks running token accuracy on the SAME logits already
+                computed for the loss, so this doesn't cost an extra
+                forward pass -- just reusing what's already there."""
+                nonlocal running_loss, running_correct_tokens, running_total_tokens
+                images, ids = images.to(device), ids.to(device)
+                decoder_input, labels = ids[:, :-1], ids[:, 1:]
+
+                optimizer.zero_grad()
+                logits = model(images, decoder_input)
+                loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+
+                with torch.no_grad():
+                    mask = labels != pad_id
+                    preds = logits.argmax(dim=-1)
+                    running_correct_tokens += ((preds == labels) & mask).sum().item()
+                    running_total_tokens += mask.sum().item()
+                return loss
 
             if args.on_the_fly:
                 for step in range(1, steps_per_epoch + 1):
                     images, ids = train_queue.get_batch(args.batch_size)
-                    images, ids = images.to(device), ids.to(device)
-                    decoder_input, labels = ids[:, :-1], ids[:, 1:]
-
-                    optimizer.zero_grad()
-                    logits = model(images, decoder_input)
-                    loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-                    loss.backward()
-                    optimizer.step()
-                    running_loss += loss.item()
+                    train_step(images, ids)
                     log_step_progress(step)
             else:
                 for step, (images, ids) in enumerate(train_loader, start=1):
-                    images, ids = images.to(device), ids.to(device)
-                    decoder_input, labels = ids[:, :-1], ids[:, 1:]
-
-                    optimizer.zero_grad()
-                    logits = model(images, decoder_input)
-                    loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-                    loss.backward()
-                    optimizer.step()
-                    running_loss += loss.item()
+                    train_step(images, ids)
                     log_step_progress(step)
 
             train_loss = running_loss / steps_per_epoch
+            train_token_acc = running_correct_tokens / max(running_total_tokens, 1)
             val_start = time.time()
             val_loss, val_token_acc = evaluate(model, val_loader, device, pad_id, criterion)
             epoch_elapsed = time.time() - epoch_start
             total_elapsed = time.time() - train_start_time
             queue_note = f"  queue_depth={train_queue.qsize()}" if args.on_the_fly else ""
             logger.info(
-                f"epoch {epoch:3d}/{args.epochs}  train_loss={train_loss:.4f}  "
-                f"val_loss={val_loss:.4f}  val_token_acc={val_token_acc:.4f}{queue_note}  "
+                f"epoch {epoch:3d}/{args.epochs}  "
+                f"train_loss={train_loss:.4f}  train_acc={train_token_acc:.4f}  "
+                f"val_loss={val_loss:.4f}  val_acc={val_token_acc:.4f}{queue_note}  "
                 f"epoch_time={format_eta(epoch_elapsed)} (val eval {format_eta(time.time() - val_start)})  "
                 f"total_elapsed={format_eta(total_elapsed)}  "
                 f"est_remaining={format_eta(epoch_elapsed * (args.epochs - epoch))}"
             )
             history.append({
-                "epoch": epoch, "train_loss": train_loss,
+                "epoch": epoch, "train_loss": train_loss, "train_token_acc": train_token_acc,
                 "val_loss": val_loss, "val_token_acc": val_token_acc,
                 "epoch_seconds": round(epoch_elapsed, 1),
             })
@@ -825,12 +838,24 @@ def main():
         json.dump(samples, f, indent=2)
     exact_match_rate = sum(s["exact_match"] for s in samples) / len(samples)
 
+    logger.info("Running round-trip test (mmd -> quickjs png -> model -> mmd, "
+                "fixed deterministic set, one per diagram type)...")
+    from roundtrip_test import run_roundtrip_test  # local import: avoids a circular
+                                                     # import at module load time (see
+                                                     # roundtrip_test.py's own note)
+    roundtrip_results = run_roundtrip_test(model, tokenizer, device, results_dir / "roundtrip")
+    roundtrip_match_rate = sum(r["exact_match"] for r in roundtrip_results) / len(roundtrip_results)
+    logger.info(f"Round-trip: {sum(r['exact_match'] for r in roundtrip_results)}/"
+                f"{len(roundtrip_results)} exact matches -- see {results_dir}/roundtrip/roundtrip_report.txt")
+
     summary = {
         "model_size_params": param_counts,
         "vocab_size": vocab_size,
         "best_val_loss": best_val_loss,
         "final_val_token_acc": history[-1]["val_token_acc"],
+        "final_train_token_acc": history[-1]["train_token_acc"],
         "qualitative_exact_match_rate": exact_match_rate,
+        "roundtrip_exact_match_rate": roundtrip_match_rate,
         "num_epochs": args.epochs,
         "on_the_fly": args.on_the_fly,
         "num_train_samples": (

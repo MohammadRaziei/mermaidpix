@@ -30,8 +30,16 @@ from torchvision import transforms
 
 from common.diagram_generators import ROUTER_CLASSES
 from model import MermaidReconstructor
-from train_reconstructor import IMG_TRANSFORM, load_tokenizer
+from train_reconstructor import build_transform, load_tokenizer
 from train_router import build_model as build_router_model
+
+# NOTE: this used to import IMG_TRANSFORM directly, a module-level constant
+# that no longer exists after train_reconstructor.py was refactored to
+# build_transform(train, augment_strength) -- broke this file's import
+# entirely (ImportError) until caught in conversation while adding
+# roundtrip_test.py. build_transform(train=False) is the exact eval-mode
+# equivalent of the old IMG_TRANSFORM.
+_EVAL_TRANSFORM = build_transform(train=False)
 
 _ROUTER_TF = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -66,7 +74,7 @@ def route(image: Image.Image, router, classes, device):
 
 @torch.no_grad()
 def reconstruct(image: Image.Image, reconstructor, tokenizer, device, max_new_tokens=500):
-    x = IMG_TRANSFORM(image.convert("RGB")).unsqueeze(0).to(device)
+    x = _EVAL_TRANSFORM(image.convert("RGB")).unsqueeze(0).to(device)
     bos_id = tokenizer.token_to_id("<s>")
     eos_id = tokenizer.token_to_id("</s>")
     pad_id = tokenizer.token_to_id("<pad>")
