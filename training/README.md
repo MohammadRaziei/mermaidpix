@@ -173,21 +173,26 @@ overfitting to the default theme's look.
   to also confirm the real TrOCR checkpoint loads, before committing to a
   long training run.
 - ✅ **Tested (torch-independent parts only)**: the on-the-fly data
-  pipeline in `train_reconstructor.py` -- `SpoolQueue` /
-  `_spool_producer_loop`, i.e. everything up to but not including the
-  torchvision `transform` call. Verified with real multiprocessing in my
-  sandbox: 3 producer processes filling a 20-sample spool queue up to its
-  backpressure cap, a consumer reading + deleting every file (all valid
-  PNGs with matching JSON metadata, zero corrupt reads), and a clean
-  shutdown with no leftover processes or files. Also caught and fixed a
-  real bug this way: with `mermaidx` imported at *module* top-level, three
-  concurrent producer processes appeared to hang producing nothing for
-  30+ seconds -- turned out to be single-core CPU contention on 3
-  processes' simultaneous ~9s QuickJS warmup (the sandbox has exactly 1
-  vCPU), not a bug, but the `import mermaidx` was moved to be local to the
-  producer function anyway as a safer default. `inspect_on_the_fly.py`
-  (see below) was tested the same way, reading a live queue while
-  producers were actively writing to it.
+  pipeline in `train_reconstructor.py` -- `SampleQueue` / `_producer_loop`,
+  i.e. everything up to but not including the torchvision `transform`
+  call. Verified with real multiprocessing in my sandbox: 2 producer
+  processes filling a bounded `multiprocessing.Queue` up to its
+  backpressure cap (confirmed producers correctly BLOCK in `put()` once
+  full, and correctly resume once the consumer drains a few items), a
+  consumer reading valid (PNG, metadata) pairs, the optional `--debug-dump`
+  disk mirror producing valid same-named PNG+JSON pairs bounded to the
+  expected count, and a clean shutdown (both processes joined without
+  needing `terminate()`). Also caught and fixed two real bugs this way:
+  (1) with `mermaidx` imported at *module* top-level, concurrent producer
+  processes appeared to hang for 30+ seconds -- turned out to be
+  single-core CPU contention on simultaneous ~9s QuickJS warmups (the
+  sandbox has exactly 1 vCPU), not a bug, but `import mermaidx` was moved
+  local to the producer function anyway as a safer default; (2) a real
+  training run's `train.log` showed epoch time climbing ~3.4x over ~19
+  epochs before suddenly dropping -- consistent with Windows Defender
+  reacting to the original disk-spool design's constant small-file churn,
+  which is why the queue itself moved to RAM (see "On-the-fly training
+  data" below) and disk became an opt-in debug-only mirror.
 
 ## Run these in order
 
@@ -211,20 +216,21 @@ separate "render N training images to disk" step anymore. To compare
 against the old fixed-image approach directly: `make data-fixed && make
 train-reconstructor-fixed`.
 
-While `make train-reconstructor` is running, you can watch what's actually
-queued for training in a separate terminal:
+The real training queue lives in RAM, so there's nothing to inspect on
+disk by default. Pass `--debug-dump` to `train_reconstructor.py` to also
+mirror recent samples to disk (cleared every epoch), then in a separate
+terminal:
 ```bash
-python inspect_on_the_fly.py --debug-dir ./results/reconstructor/otf_queue --watch
+python inspect_on_the_fly.py --debug-dir ./results/reconstructor/otf_debug --watch
 ```
 
 Then send me `results.zip`. Each training script also prints an explicit
 list of what to paste back in the terminal output, but the zip has
 everything already: `results/router/{summary.json,history.json,router_model.pt}`
-and `results/reconstructor/{summary.json,history.json,qualitative_samples.json,reconstructor_model.pt}`.
+and `results/reconstructor/{summary.json,history.json,qualitative_samples.json,roundtrip/,reconstructor_model.pt}`.
 
-If bandwidth is a concern, `make package` runs `python package_results.py`
-which supports `--no-checkpoints` to exclude the (small, but non-zero)
-`.pt` files and keep only logs/metrics/samples.
+`make package` excludes model `.pt` checkpoints by default now (bandwidth)
+-- use `make package-with-checkpoints` to include them.
 
 ## On-the-fly training data
 
@@ -239,17 +245,35 @@ shortcut unavailable: no two training samples are ever the same image
 twice. The **val** split stays fixed (needed for val_loss to be comparable
 across epochs/runs).
 
-It's implemented as a disk-backed producer/consumer queue
-(`SpoolQueue`/`_spool_producer_loop` in `train_reconstructor.py`), not a
-plain `DataLoader(num_workers=N)`: `--num-workers` producer OS processes
-each independently render random diagrams via `mermaidx` and write them as
-`(png, json)` file pairs into `results/reconstructor/otf_queue/`; the
-trainer reads and immediately deletes each pair the moment it consumes it.
-That directory's current contents ARE the live queue, which is what makes
-`inspect_on_the_fly.py` possible as a completely separate, read-only
-process -- it just lists/opens files, with zero coupling to the trainer.
-`--queue-depth-batches` (default 10) caps how many batches' worth of
-samples producers are allowed to get ahead by.
+It's implemented as an in-RAM producer/consumer queue (`SampleQueue` /
+`_producer_loop` in `train_reconstructor.py`, backed by
+`multiprocessing.Queue`), not a plain `DataLoader(num_workers=N)`:
+`--num-workers` producer OS processes each independently render random
+diagrams via `mermaidx` and `put()` them straight onto the queue -- OS
+pipes, no disk. `put()`/`get()` block/unblock automatically at
+`--queue-depth-batches` (default 10 batches' worth of samples), which is
+the backpressure, natively, no polling loop needed. This used to be a
+disk-backed spool directory specifically so an independent process could
+inspect the live queue -- moved to RAM after a real run's `train.log`
+showed evidence of Windows Defender-driven slowdown from that design's
+constant small-file churn (see "What's tested" above and IDEA.md's Round
+2/3 analysis). The inspectability goal is preserved as an opt-in
+`--debug-dump` flag instead: producers also mirror each sample to a small,
+bounded, per-worker set of disk slots (PNG + a same-named `.json` with the
+generation info -- target Mermaid source, theme, look, engine), cleared
+once per epoch, purely for `inspect_on_the_fly.py` to look at.
+
+## Round-trip test
+
+At the end of every `train_reconstructor.py` run, `roundtrip_test.py` runs
+automatically: a small, fixed, deterministic set (one example per diagram
+type, same every run) gets rendered with mermaidx's own quickjs backend,
+fed through the just-trained model, and the (ground_truth, prediction)
+pairs get written to `results/reconstructor/roundtrip/` --
+`roundtrip_report.txt` (human-eyeballable), `roundtrip_report.json`
+(machine-readable), and `images/` (what the model actually saw). Re-run
+standalone against any saved checkpoint with `make roundtrip` (or `python
+roundtrip_test.py --model <path> --tokenizer <path>`), without retraining.
 
 ## Files
 
@@ -262,10 +286,13 @@ samples producers are allowed to get ahead by.
 | `model.py` | the TrOCR-encoder + small-decoder architecture; `python model.py` prints param counts (add `--download` to also verify the real checkpoint loads) |
 | `train_router.py` | trains the diagram-type classifier (Step 3) |
 | `train_reconstructor.py` | trains the image->code model (Step 4) -- on-the-fly training data by default, see above |
-| `inspect_on_the_fly.py` | separate, read-only tool to watch the live on-the-fly training queue while training runs |
+| `hf_offline_first.py` | shared helper: load a HuggingFace checkpoint from local cache only, falling back to a real download just once if it isn't cached yet -- avoids repeated network attempts on a flaky connection |
+| `roundtrip_test.py` | mmd -> quickjs png -> model -> mmd sanity check, run automatically after training (see above), or standalone via `make roundtrip` |
+| `inspect_on_the_fly.py` | separate, read-only tool to watch the on-the-fly training data (only useful with `--debug-dump`, see above) |
 | `infer.py` | run the finished pipeline on a real image (Step 5, after training) |
 | `package_results.py` | zips `results/` for you to send back |
 | `Makefile` | orchestrates all of the above in order |
+| `exclude_from_defender.bat` | Windows-only: adds a Defender exclusion for this folder, to test the antivirus-slowdown hypothesis above |
 
 ## Extending further
 

@@ -68,18 +68,21 @@ from common.diagram_generators import (
 # and runs. The old fixed-manifest training path is kept available via
 # --no-on-the-fly for direct before/after comparison.
 #
-# NOTE 3 -- on-the-fly is implemented as a disk-backed spool queue
-# (SpoolQueue below), not a plain DataLoader(num_workers=N). Requested in
-# conversation specifically so a *separate, independent* process can watch
-# what's actually queued for training without touching the trainer at all:
-# N producer OS processes each independently render diagrams and write them
-# as (png, json) file pairs into a small directory; this process reads and
-# immediately deletes each pair the moment it consumes it. That directory's
-# current contents ARE the live queue -- its depth is just a file count,
-# and a read-only inspector (see inspect_on_the_fly.py) can list/open those
-# files at any time, live, with zero IPC into the trainer. This trades a
-# small amount of disk I/O (write+read a PNG instead of passing a tensor
-# through DataLoader's internal shared-memory queue) for that transparency.
+# NOTE 3 -- on-the-fly is implemented as an in-RAM producer/consumer queue
+# (SampleQueue below, backed by multiprocessing.Queue), not a plain
+# DataLoader(num_workers=N). N producer OS processes each independently
+# render diagrams and put them straight onto the queue (OS pipes, RAM --
+# no disk). This used to be disk-spooled (files in a directory) so an
+# independent process could inspect the live queue with zero coupling to
+# the trainer -- but a real training run's train.log showed epoch time
+# climbing ~3.4x over ~19 epochs before suddenly dropping (see IDEA.md's
+# Round 2/3 analysis), consistent with Windows Defender reacting to the
+# constant small-file churn that design produced. SampleQueue removes
+# disk from the hot path entirely; the external-inspectability goal is
+# now opt-in instead of default -- pass debug_dir to also mirror samples
+# to a small, bounded, per-worker set of disk slots purely for
+# inspect_on_the_fly.py, cleared once per epoch so it can't reproduce the
+# same file-churn problem.
 
 from model import MermaidReconstructor
 
@@ -259,37 +262,44 @@ class ReconstructorDataset(Dataset):
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
-    """Write-then-rename so a reader (the trainer, or an independent
-    inspector process) can never open a half-written file: os.replace is
-    atomic on the same filesystem, so `path` only ever appears once it's
-    fully written."""
+    """Write-then-rename so a reader (an independent inspector process)
+    can never open a half-written file: os.replace is atomic on the same
+    filesystem, so `path` only ever appears once it's fully written. Only
+    used for the OPTIONAL debug mirror now -- see NOTE 3 and
+    _producer_loop below -- never on the real training data path."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "wb") as f:
         f.write(data)
     os.replace(tmp, path)
 
 
-def _spool_producer_loop(
-    spool_dir: Path,
+def _producer_loop(
+    queue: "mp.Queue",
     seed: int,
     worker_id: int,
-    max_queue_samples: int,
     render_widths: tuple[int, ...],
-    poll_interval: float,
     stop_event,
     render_engines: tuple[str, ...] = ("quickjs",),
+    debug_dir: Path | None = None,
+    debug_slots_per_worker: int = 4,
 ) -> None:
-    """Runs in its own OS process (spawned by SpoolQueue.start). Endlessly
-    renders fresh random diagrams and writes each as a (png, json) file
-    pair into `spool_dir` -- that directory IS the queue: a file existing
-    there means "queued, not yet consumed"; the trainer deletes a pair the
-    moment it reads it (see SpoolQueue.get_batch). A separate, read-only
-    process can inspect exactly what's queued, right now, just by listing
-    this directory -- see inspect_on_the_fly.py.
+    """Runs in its own OS process (spawned by SampleQueue.__init__).
+    Endlessly renders fresh random diagrams and puts each one straight
+    onto `queue` -- a real multiprocessing.Queue (OS pipes, in RAM), not a
+    file. `queue.put(..., block=True)` blocks automatically once the
+    queue is full (see SampleQueue's maxsize), which IS this pipeline's
+    backpressure: a producer just naturally stalls until the trainer
+    drains a slot, then resumes -- no polling loop needed, unlike the
+    previous disk-spool design.
 
-    Backpressure: if the directory already holds >= max_queue_samples
-    pending pairs, this just polls and waits instead of rendering more, so
-    a slow GPU step can't make disk usage grow without bound.
+    debug_dir (optional): if set, ALSO writes a copy of each sample to a
+    small, bounded, per-worker set of rotating slots on disk -- purely for
+    an independent process (see inspect_on_the_fly.py) to look at, never
+    read back into training. Off by default. The trainer clears this
+    directory once per epoch (see SampleQueue.clear_debug_dir), so it
+    never reflects more than roughly the current epoch's most recent
+    samples. Each PNG gets a same-named .json sidecar with the generation
+    info (target Mermaid source, theme, look, engine, etc.) next to it.
 
     render_engines: which backend(s) to render each sample with, chosen
     uniformly at random per sample. "quickjs" is mermaidx's own default
@@ -313,15 +323,10 @@ def _spool_producer_loop(
     property a real-world image would ever have, so conditioning on it
     wouldn't generalize past this synthetic dataset).
     """
-    # Imported HERE, not at module top-level: this must be the first thing
-    # that touches mermaidx in this process. Tested in conversation --
-    # importing mermaidx in the PARENT before forking children looked at
-    # first like it deadlocked every child (0 output for 30+ seconds); it
-    # turned out to actually just be single-core CPU contention between
-    # N processes' ~9s QuickJS warmup on a constrained sandbox, not a real
-    # fork hazard -- but keeping the import local costs nothing and is the
-    # safer default regardless of what other libraries end up sharing this
-    # process in the future.
+    # Imported HERE, not at module top-level -- see conversation: keeping
+    # mermaidx (and here, the debug-mirror file writes) out of anything
+    # the parent process touches before spawning workers is the safer
+    # default regardless of what else ends up sharing this process.
     import mermaidx
 
     non_quickjs_engines = [e for e in render_engines if e != "quickjs"]
@@ -338,13 +343,8 @@ def _spool_producer_loop(
 
     rng = random.Random(seed * 1_000_003 + worker_id)
     diagram_types = list(DIAGRAM_BUILDERS.keys())
-    counter = 0
+    debug_counter = 0
     while not stop_event.is_set():
-        pending = sum(1 for _ in spool_dir.glob("*.png"))
-        if pending >= max_queue_samples:
-            time.sleep(poll_interval)
-            continue
-
         diagram_type = rng.choice(diagram_types)
         src = DIAGRAM_BUILDERS[diagram_type](rng)
         theme, look = random_theme_and_look(rng)
@@ -365,32 +365,58 @@ def _spool_producer_loop(
         if png_bytes is None:
             continue
 
-        counter += 1
-        base = f"w{worker_id:02d}_{counter:08d}_{time.time_ns()}"
         meta = {
             "diagram_type": diagram_type, "theme": theme, "look": look,
             "width": width, "target": src, "worker_id": worker_id,
             "engine": engine,  # provenance/debugging only -- never fed to the model, see docstring
             "written_at": time.time(),
         }
+
+        if debug_dir is not None:
+            debug_counter += 1
+            slot = debug_counter % debug_slots_per_worker
+            base = f"w{worker_id:02d}_slot_{slot:02d}"
+            try:
+                _atomic_write(debug_dir / f"{base}.png", png_bytes)
+                _atomic_write(debug_dir / f"{base}.json", json.dumps(meta, indent=2).encode("utf-8"))
+            except OSError:
+                pass  # best-effort debug mirror -- must never take down the real pipeline
+
         try:
-            _atomic_write(spool_dir / f"{base}.png", png_bytes)
-            _atomic_write(spool_dir / f"{base}.json", json.dumps(meta).encode("utf-8"))
-        except OSError:
-            # e.g. disk hiccup -- drop this one sample, keep the producer alive
-            continue
+            queue.put((png_bytes, meta), block=True)  # blocks here == the backpressure
+        except (BrokenPipeError, ValueError, OSError):
+            # queue/consumer torn down during shutdown -- exit quietly
+            break
 
 
-class SpoolQueue:
-    """Disk-backed producer/consumer queue for on-the-fly training data --
-    see NOTE 3 near the top of this file for the reasoning. `num_workers`
-    producer processes fill `spool_dir`; get_batch() (called from the main
-    training process) reads and deletes files as it consumes them.
+class SampleQueue:
+    """In-RAM producer/consumer queue for on-the-fly training data.
+
+    NOTE 3 UPDATE (see original NOTE 3 above): this used to be disk-backed
+    (SpoolQueue, files in a spool directory) specifically so an
+    independent process could inspect the live queue with zero coupling
+    to the trainer. A real training run's train.log showed something else
+    though: epoch time climbed ~3.4x over the first ~19 epochs before
+    suddenly dropping back down (see IDEA.md's Round 2/3 analysis) --
+    strongly consistent with Windows Defender's real-time scanner reacting
+    to the constant small-file churn that disk-spool design produced.
+    Backing the real queue with multiprocessing.Queue instead (OS pipes,
+    RAM only) removes that concern entirely by removing disk I/O from the
+    hot path altogether -- put()/get() block/unblock automatically at
+    `maxsize`, which is exactly the desired backpressure, natively, no
+    polling loop needed anymore either.
+
+    The external-inspectability goal isn't dropped, just made optional and
+    moved off the hot path: pass debug_dir to also mirror each sample to a
+    small, bounded, per-worker set of rotating disk slots purely for
+    inspect_on_the_fly.py to look at (never read back into training) --
+    off by default, and cleared once per epoch by the trainer (see
+    clear_debug_dir) so it can't accumulate into the same kind of
+    file-churn this redesign was meant to get away from.
     """
 
     def __init__(
         self,
-        spool_dir: Path,
         tokenizer: ByteLevelBPETokenizer,
         transform: transforms.Compose,
         num_workers: int,
@@ -398,32 +424,36 @@ class SpoolQueue:
         batch_size: int,
         seed: int = 0,
         max_len: int = 640,
-        poll_interval: float = 0.05,
         render_widths: tuple[int, ...] = (600, 800, 1000),
         render_engines: tuple[str, ...] = ("quickjs",),
+        debug_dir: Path | None = None,
+        debug_slots_per_worker: int = 4,
     ):
-        self.spool_dir = spool_dir
         self.tokenizer = tokenizer
         self.transform = transform
         self.max_len = max_len
-        self.poll_interval = poll_interval
         self.bos_id = tokenizer.token_to_id("<s>")
         self.eos_id = tokenizer.token_to_id("</s>")
         self.pad_id = tokenizer.token_to_id("<pad>")
-        self.max_queue_samples = queue_depth_batches * batch_size
+        self.debug_dir = debug_dir
+        self.debug_slots_per_worker = debug_slots_per_worker
 
-        # Fresh start: don't let leftover files from a previous (e.g.
-        # crashed) run get silently consumed as if they were live data.
-        if spool_dir.exists():
-            shutil.rmtree(spool_dir)
-        spool_dir.mkdir(parents=True, exist_ok=True)
-
+        maxsize = queue_depth_batches * batch_size
+        self._queue = mp.Queue(maxsize=maxsize)
         self._stop_event = mp.Event()
+
+        if debug_dir is not None:
+            # Fresh start: don't let leftover files from a previous (e.g.
+            # crashed) run get confused for live samples.
+            if debug_dir.exists():
+                shutil.rmtree(debug_dir)
+            debug_dir.mkdir(parents=True, exist_ok=True)
+
         self._procs = [
             mp.Process(
-                target=_spool_producer_loop,
-                args=(spool_dir, seed, i, self.max_queue_samples,
-                      render_widths, poll_interval, self._stop_event, render_engines),
+                target=_producer_loop,
+                args=(self._queue, seed, i, render_widths, self._stop_event, render_engines,
+                      debug_dir, debug_slots_per_worker),
                 daemon=True,
             )
             for i in range(num_workers)
@@ -432,39 +462,38 @@ class SpoolQueue:
             p.start()
 
     def qsize(self) -> int:
-        """Current queue depth in samples -- what an independent inspector
-        (or this process's own logging) sees by listing spool_dir."""
-        return sum(1 for _ in self.spool_dir.glob("*.png"))
+        """Current queue depth in samples. Note: multiprocessing.Queue's
+        qsize() raises NotImplementedError on macOS (sem_getvalue() isn't
+        supported there) -- degrade to -1 ("unknown") instead of crashing
+        logging/progress code on that platform; works fine on Windows and
+        Linux, which is what this project has actually been run on."""
+        try:
+            return self._queue.qsize()
+        except NotImplementedError:
+            return -1
+
+    def clear_debug_dir(self) -> None:
+        """Called once per epoch by the trainer (see main()) -- keeps the
+        optional debug mirror from ever showing more than roughly the
+        current epoch's most recent samples, per conversation."""
+        if self.debug_dir is not None:
+            shutil.rmtree(self.debug_dir, ignore_errors=True)
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
 
     def get_batch(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
         images: list[torch.Tensor] = []
         id_lists: list[torch.Tensor] = []
-        while len(images) < batch_size:
-            for png_path in sorted(self.spool_dir.glob("*.png")):
-                if len(images) >= batch_size:
-                    break
-                json_path = png_path.with_suffix(".json")
-                try:
-                    with open(json_path) as f:
-                        meta = json.load(f)
-                    img = Image.open(png_path)
-                    img.load()  # force full read into memory before we delete the file
-                except (FileNotFoundError, OSError, json.JSONDecodeError):
-                    # extremely unlikely (only this process deletes), but a
-                    # torn read shouldn't crash training -- just skip it
-                    continue
-                finally:
-                    png_path.unlink(missing_ok=True)
-                    json_path.unlink(missing_ok=True)
-
-                img_tensor = self.transform(img.convert("RGB"))
-                ids = self.tokenizer.encode(meta["target"]).ids
-                ids = [self.bos_id] + ids[: self.max_len - 2] + [self.eos_id]
-                images.append(img_tensor)
-                id_lists.append(torch.tensor(ids, dtype=torch.long))
-
-            if len(images) < batch_size:
-                time.sleep(self.poll_interval)
+        for _ in range(batch_size):
+            # Blocks until a producer has something -- exactly the right
+            # behavior when the GPU momentarily outpaces production; no
+            # busy-polling needed, unlike the old disk-spool version.
+            png_bytes, meta = self._queue.get()
+            img = Image.open(io.BytesIO(png_bytes))
+            img_tensor = self.transform(img.convert("RGB"))
+            ids = self.tokenizer.encode(meta["target"]).ids
+            ids = [self.bos_id] + ids[: self.max_len - 2] + [self.eos_id]
+            images.append(img_tensor)
+            id_lists.append(torch.tensor(ids, dtype=torch.long))
 
         max_len = max(len(ids) for ids in id_lists)
         padded = torch.full((len(id_lists), max_len), self.pad_id, dtype=torch.long)
@@ -474,11 +503,20 @@ class SpoolQueue:
 
     def shutdown(self) -> None:
         self._stop_event.set()
+        # A producer can be blocked inside queue.put() on a full queue and
+        # won't notice stop_event until that call returns -- drain
+        # whatever's left so any such blocked put() can complete and the
+        # producer can then see stop_event and exit on its next loop.
+        try:
+            while True:
+                self._queue.get_nowait()
+        except Exception:
+            pass
         for p in self._procs:
             p.join(timeout=5)
             if p.is_alive():
                 p.terminate()
-        shutil.rmtree(self.spool_dir, ignore_errors=True)
+        self._queue.close()
 
 
 class PadCollate:
@@ -616,20 +654,21 @@ def main():
                           "looks noisy/unstable, lower if each epoch takes too long.")
     ap.add_argument("--num-workers", type=int, default=4,
                      help="number of producer OS processes rendering diagrams in parallel for "
-                          "--on-the-fly (see SpoolQueue). Measured in-sandbox (single process, "
+                          "--on-the-fly (see SampleQueue). Measured in-sandbox (single process, "
                           "CPU): ~9s one-time mermaidx/QuickJS engine warmup per process, then "
                           "~0.1-0.95s/render steady-state (~0.3s avg) depending on diagram type. "
                           "Each worker pays the ~9s warmup once, not per sample. Size this against "
                           "your GPU's forward+backward time per batch: if production is slower, "
                           "the trainer blocks in get_batch() waiting on the queue -- watch the "
-                          "'queue depth' logged each epoch and add workers if it's often near 0."
+                          "'queue depth' logged each epoch and add workers if it's often near 0. "
                           "With --no-on-the-fly this is instead passed straight through as "
                           "DataLoader(num_workers=...) for the fixed-manifest path.")
     ap.add_argument("--queue-depth-batches", type=int, default=10,
-                     help="only used with --on-the-fly. Producers stop rendering once the spool "
-                          "queue holds this many batches' worth of samples, so a slow GPU step "
-                          "can't make disk usage grow without bound. Also caps how much can ever "
-                          "be 'in flight' for inspect_on_the_fly.py to look at.")
+                     help="only used with --on-the-fly. The in-RAM queue (see SampleQueue) holds "
+                          "at most this many batches' worth of samples -- producers block "
+                          "automatically once it's full and resume as soon as the trainer "
+                          "consumes a slot, so this bounds memory use, not disk (there is no disk "
+                          "in the hot path anymore).")
     ap.add_argument("--render-engines", nargs="+", default=["quickjs"],
                      choices=["quickjs", "merman", "mermaid-rs-renderer"],
                      help="only used with --on-the-fly. Each sample is rendered with one engine "
@@ -640,12 +679,23 @@ def main():
                           "renderer-agnostic. Verified in conversation: merman renders near-"
                           "identical to quickjs, mermaid-rs-renderer differs meaningfully "
                           "(different colors/arrow style, and can even mirror left/right branch "
-                          "placement) -- see the docstring on _spool_producer_loop. Default is "
+                          "placement) -- see the docstring on _producer_loop. Default is "
                           "quickjs-only so `mmdr` stays an optional dependency; try e.g. "
                           "--render-engines quickjs merman mermaid-rs-renderer for the full mix.")
+    ap.add_argument("--debug-dump", action="store_true",
+                     help="only used with --on-the-fly. Off by default. When set, producers ALSO "
+                          "mirror each sample (PNG + a same-named .json with the generation info: "
+                          "target Mermaid source, theme, look, engine, etc.) to "
+                          "results/reconstructor/otf_debug/ -- a small, bounded, per-worker set of "
+                          "rotating slots, purely so a separate process (inspect_on_the_fly.py) "
+                          "can look at real recent samples while training runs. Cleared at the "
+                          "start of every epoch. This is the ONLY thing that touches disk in the "
+                          "on-the-fly data path -- leave it off unless you're actively debugging "
+                          "what's being generated, since it re-introduces exactly the kind of "
+                          "small-file disk churn SampleQueue was built to avoid (see NOTE 3).")
     ap.add_argument("--seed", type=int, default=0,
                      help="seeds the on-the-fly generator (per-worker-derived, see "
-                          "_spool_producer_loop) for reproducible debugging")
+                          "_producer_loop) for reproducible debugging")
     ap.add_argument("--results-dir", type=str, default="./results/reconstructor")
     ap.add_argument("--log-every", type=int, default=20,
                      help="log a progress line every N training steps (in addition to the "
@@ -684,27 +734,30 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                              collate_fn=collate, num_workers=2)
 
-    train_queue = None  # SpoolQueue, only used when args.on_the_fly
+    train_queue = None  # SampleQueue, only used when args.on_the_fly
     if args.on_the_fly:
-        spool_dir = results_dir / "otf_queue"
+        debug_dir = (results_dir / "otf_debug") if args.debug_dump else None
         logger.info(f"train data: on-the-fly generation via {args.num_workers} producer processes, "
-                    f"disk-spool queue at {spool_dir} (depth cap {args.queue_depth_batches} batches, "
+                    f"in-RAM queue (depth cap {args.queue_depth_batches} batches, "
                     f"{args.steps_per_epoch} steps/epoch, batch size {args.batch_size})")
-        logger.info(f"  -> while training runs, inspect the live queue with: "
-                    f"python inspect_on_the_fly.py --debug-dir {spool_dir}")
+        if debug_dir is not None:
+            logger.info(f"  -> --debug-dump is on: mirroring recent samples to {debug_dir} "
+                        f"(cleared every epoch). Inspect with: "
+                        f"python inspect_on_the_fly.py --debug-dir {debug_dir}")
         logger.info(f"  -> queue depth will read 0 for the first ~10-15s: each of the "
                     f"{args.num_workers} producer processes pays a one-time mermaidx/QuickJS "
                     f"engine warmup before its first render (measured ~9s on an otherwise-idle "
                     f"CPU core in testing -- longer if workers > CPU cores, since they then "
                     f"compete for the same core during that CPU-bound warmup). This is normal, "
                     f"not a hang.")
-        train_queue = SpoolQueue(
-            spool_dir, tokenizer, train_tf,
+        train_queue = SampleQueue(
+            tokenizer, train_tf,
             num_workers=args.num_workers,
             queue_depth_batches=args.queue_depth_batches,
             batch_size=args.batch_size,
             seed=args.seed,
             render_engines=tuple(args.render_engines),
+            debug_dir=debug_dir,
         )
         steps_per_epoch = args.steps_per_epoch
     else:
@@ -738,12 +791,14 @@ def main():
             running_correct_tokens = 0
             running_total_tokens = 0
             epoch_start = time.time()
+            if train_queue is not None:
+                train_queue.clear_debug_dir()  # no-op unless --debug-dump was passed
 
             def log_step_progress(step: int) -> None:
                 """Shared by both branches below -- every --log-every steps,
                 print elapsed/rate/ETA so a long, quiet epoch (on-the-fly
                 especially, where a step can genuinely take a second or more
-                once rendering is the bottleneck -- see SpoolQueue) doesn't
+                once rendering is the bottleneck -- see SampleQueue) doesn't
                 look indistinguishable from a hang in a terminal/tmux
                 session with nothing else on screen to prove otherwise."""
                 if step % args.log_every != 0 and step != steps_per_epoch:

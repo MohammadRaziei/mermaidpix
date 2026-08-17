@@ -1,25 +1,29 @@
 """
 inspect_on_the_fly.py — read-only, independent inspector for the on-the-fly
-reconstructor training queue (see SpoolQueue / NOTE 3 in train_reconstructor.py).
+reconstructor training data (see SampleQueue / NOTE 3 in
+train_reconstructor.py).
 
-Run this in a SEPARATE terminal while `train_reconstructor.py --on-the-fly`
-(the default) is running, to sanity-check that the images actually being
-queued for training are valid and look right -- without touching the
-trainer at all. The spool directory it reads IS the live queue: every
-(.png, .json) pair sitting there right now is a sample the trainer hasn't
-consumed yet. This script only ever reads; it never deletes anything, so
-it can't interfere with training even if you leave it running.
+The real training queue is in-RAM (multiprocessing.Queue, not disk) as of
+this version, so there's nothing on disk to inspect UNLESS training was
+started with --debug-dump. When it is, producers ALSO mirror each sample
+to a small, bounded, rotating set of per-worker slots on disk, purely for
+this script to look at -- never read back into training. That directory
+is cleared once per epoch by the trainer, so what you see here is "roughly
+the last few seconds of production," not the actual pending queue depth
+(there's no way to see that from outside anymore -- it's in RAM inside the
+trainer process). This script only ever reads; it never deletes anything,
+so it can't interfere with training even if you leave it running.
 
-Usage:
+Usage (only meaningful if training was started with --debug-dump):
     # one-shot snapshot
-    python inspect_on_the_fly.py --debug-dir ./results/reconstructor/otf_queue
+    python inspect_on_the_fly.py --debug-dir ./results/reconstructor/otf_debug
 
     # keep re-checking every few seconds, like `watch`
-    python inspect_on_the_fly.py --debug-dir ./results/reconstructor/otf_queue --watch
+    python inspect_on_the_fly.py --debug-dir ./results/reconstructor/otf_debug --watch
 
-    # also copy the current queue's images somewhere you can open with a
+    # also copy the current snapshot's images somewhere you can open with a
     # normal image viewer
-    python inspect_on_the_fly.py --debug-dir ./results/reconstructor/otf_queue --copy-to ./otf_preview
+    python inspect_on_the_fly.py --debug-dir ./results/reconstructor/otf_debug --copy-to ./otf_preview
 """
 from __future__ import annotations
 
@@ -39,7 +43,7 @@ def inspect_once(debug_dir: Path, copy_to: Path | None = None) -> None:
 
     png_paths = sorted(debug_dir.glob("*.png"))
     now = time.time()
-    print(f"\n[{time.strftime('%H:%M:%S')}] queue depth: {len(png_paths)} samples in {debug_dir}")
+    print(f"\n[{time.strftime('%H:%M:%S')}] {len(png_paths)} samples currently in debug mirror: {debug_dir}")
 
     if not png_paths:
         print("  (empty -- either the trainer just consumed everything, or producers "
@@ -91,8 +95,9 @@ def inspect_once(debug_dir: Path, copy_to: Path | None = None) -> None:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--debug-dir", type=str, default="./results/reconstructor/otf_queue",
-                     help="the spool queue directory -- must match --results-dir/otf_queue from "
+    ap.add_argument("--debug-dir", type=str, default="./results/reconstructor/otf_debug",
+                     help="the debug-mirror directory -- only populated if training was started "
+                          "with --debug-dump; must match --results-dir/otf_debug from the running "
                           "the running train_reconstructor.py --on-the-fly process")
     ap.add_argument("--watch", action="store_true",
                      help="keep re-checking every --interval seconds instead of a single snapshot")

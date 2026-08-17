@@ -873,11 +873,11 @@ this is exactly the kind of free, still-perfectly-labeled visual-style
 diversity that on-the-fly generation was already providing via
 theme/color-jitter, just from a structurally different source.
 
-**Implemented in `_spool_producer_loop`** (`train_reconstructor.py`): each
+**Implemented in `_producer_loop`** (`train_reconstructor.py`): each
 sample is rendered with one engine chosen uniformly at random from
 `--render-engines` (default: `("quickjs",)`, i.e. unchanged behavior --
 `mmdr` stays an optional dependency). The engine used is recorded in each
-sample's spool metadata (`meta["engine"]`) for later debugging/analysis,
+sample's metadata (`meta["engine"]`) for later debugging/analysis,
 but is deliberately **not** fed into the model as an input or conditioning
 signal -- see the "not added to router" decision below.
 
@@ -897,8 +897,51 @@ The model should simply become robust to which renderer produced an image
 through exposure to the diversity, the same way it's meant to become
 robust to theme/color variation already -- not be told the answer.
 
+## SampleQueue: moved the on-the-fly training queue from disk to RAM (implemented)
+
+The on-the-fly queue (originally `SpoolQueue`) was disk-backed: producer
+processes wrote `(png, json)` file pairs into a spool directory, the
+trainer read and deleted each one. This was a deliberate choice at the
+time, specifically so an independent process (`inspect_on_the_fly.py`)
+could watch the live queue with zero coupling to the trainer.
+
+**Evidence it was actually costing something real**: a genuine training
+run's `train.log` (see the Round 2/3 analysis above) showed epoch time
+climbing from ~1000s to ~3485s over the first ~19 epochs, then suddenly
+dropping back to ~800s and staying there. `queue_depth` stayed pinned
+near its cap the entire time (producers were never the bottleneck), which
+pointed at the disk I/O itself. Raised in conversation: since the queue
+was constantly writing and deleting thousands of small files, this is a
+textbook trigger for Windows Defender's real-time scanner to bog down --
+consistent with the climb-then-sudden-drop shape (a scan cache warming up
+or an exclusion kicking in).
+
+**Fix**: `SampleQueue` (`train_reconstructor.py`) replaces the disk spool
+with a `multiprocessing.Queue` (OS pipes, RAM -- no filesystem writes at
+all in the default configuration). This also simplified the backpressure
+logic: the old design polled the spool directory's file count in a loop;
+`multiprocessing.Queue(maxsize=...)` blocks `put()` automatically once
+full and unblocks it automatically once the consumer `get()`s an item --
+no polling needed.
+
+**Inspectability preserved as opt-in, not default**: `--debug-dump`
+mirrors each sample to a small, bounded, per-worker set of rotating disk
+slots (same naming scheme as the old spool design: a PNG with a same-named
+`.json` sidecar holding the generation info -- target Mermaid source,
+theme, look, engine, timestamp), cleared once per epoch by the trainer so
+it can never reproduce the same file-churn problem. `inspect_on_the_fly.py`
+still works unchanged against this mirror, just off by default now.
+
+**Tested in conversation** with a real multiprocessing harness (2
+producer processes, `maxsize=10`): confirmed producers correctly block in
+`put()` once the queue reaches its cap, correctly resume once 5 items are
+drained (queue climbed back toward the cap within the observed window),
+the debug mirror produced exactly the expected number of valid PNG+JSON
+pairs (`num_workers x debug_slots_per_worker`), and shutdown drained the
+queue and joined both processes cleanly without needing `terminate()`.
+
 **Idea, not yet implemented.** Every image this model has ever been
-trained *or* validated on -- on-the-fly (`SpoolQueue`) or fixed-manifest,
+trained *or* validated on -- on-the-fly (`SampleQueue`) or fixed-manifest,
 doesn't matter -- comes from `mermaidx`'s own renderer: same fonts, same
 layout engine, same rendering quirks. That means the current val_loss /
 val_token_acc / exact-match numbers can only ever tell you how well the
